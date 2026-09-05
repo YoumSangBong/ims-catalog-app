@@ -43,7 +43,7 @@ CREATE TABLE iaf_group (
 CREATE TABLE company (
     company_id      bigserial PRIMARY KEY,
     company_name    varchar(200) NOT NULL,
-    biz_reg_no      varchar(20),
+    biz_reg_no      varchar(20) UNIQUE,     -- '111-11-11111' 형식(앱단 검증), 중복등록불가(수정검토1.6)
     created_at      timestamptz NOT NULL DEFAULT now()
 );
 
@@ -145,7 +145,8 @@ CREATE TABLE org_chart (
     org_chart_id        bigserial PRIMARY KEY,
     org_chart_name       varchar(200) NOT NULL,
     industry_tag          varchar(50),
-    company_size_tag       varchar(20),             -- micro/small/medium/large
+    company_size_tag       varchar(20),             -- 10인미만/10~49인/50~99인/100~299인/300~999인/1000인이상
+                                                      -- (수정검토1.6, 기존 micro/small/medium/large에서 변경)
     source_company_id       bigint REFERENCES company(company_id),
     is_template               boolean NOT NULL DEFAULT true,
     created_at                 timestamptz NOT NULL DEFAULT now()
@@ -164,18 +165,27 @@ CREATE TABLE org_chart_role (
 
 CREATE TABLE application (
     application_id      bigserial PRIMARY KEY,
-    company_id           bigint NOT NULL REFERENCES company(company_id),
+    company_id           bigint REFERENCES company(company_id),   -- nullable로 변경(수정검토1.6) — 샘플 등록 시 NULL
+    sample_name            varchar(200),    -- 수정검토1.6 추가 — 샘플 등록 시 사용(company_id와 양자택일)
+    sample_original           varchar(300),    -- 수정검토1.6 추가 — 샘플 원본 소스명(project_no의 소스명과 대응, 예: 'itcpass')
+    org_scale                   varchar(20),     -- 수정검토1.6 추가 — 등록 시점의 직원수 규모(10인미만~1000인이상 6단계).
+                                                   -- org_chart는 이 시점에 아직 없을 수 있어 application에 우선 기록하고,
+                                                   -- 이후 조직도 생성 시 org_chart.company_size_tag로 옮겨 씀.
     project_no             varchar(120) UNIQUE NOT NULL,  -- 프로젝트제목 생성규칙(작성기준_r7, 2026-08-24 확정, 소문자):
                                                             -- {std_code 소문자}{sector_code}{profile_seq 2자리}_{소스구분}{No 2자리}({소스명}) | 회사명
                                                             -- 소스구분: s=기존외부소싱샘플 n=신규내부제작샘플 x=기존내부보유 (없음)=신규내부제작(실제 회사)
                                                             -- 예: qm01a01_s01(itcpass), qehsc82f01_경영시스템주식회사. 애플리케이션(백엔드)에서 생성해 채움, 원본(HWP) 프로젝트는 접미사 없음
     std_code_normalized    varchar(4) NOT NULL,     -- 'q'|'e'|'hs'|'qe'|'qhs'|'ehs'|'qehs' 7종 그대로 저장
     active_stds              jsonb NOT NULL,          -- ['q','e','hs'] 형태 배열 — doc_type 매칭용
-    sector_code                 varchar(10) NOT NULL,
+    sector_code                 varchar(10) NOT NULL,   -- 전체(M17f) | 업종코드만(M17) | 대분류만(M) 중 확인 가능한 수준까지(수정검토1.6)
     profile_id                    bigint REFERENCES sector_profile(profile_id),
     org_chart_id                    bigint REFERENCES org_chart(org_chart_id),
     status                            varchar(20) NOT NULL DEFAULT 'in_progress',
-    created_at                         timestamptz NOT NULL DEFAULT now()
+    created_at                         timestamptz NOT NULL DEFAULT now(),
+    CHECK (
+        (company_id IS NOT NULL AND sample_name IS NULL)
+        OR (company_id IS NULL AND sample_name IS NOT NULL)
+    )
 );
 
 -- ---------- 영역 2-보조. 전환 프로젝트 (3순위 재검토 2차, 2026-08-18 추가) ----------
