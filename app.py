@@ -153,7 +153,17 @@ if page.startswith("1"):
             FROM doc_type
             WHERE category = ANY(%s)
               AND applicable_std ?| %s
-            ORDER BY category, doc_type_code
+            ORDER BY
+                CASE category
+                    WHEN 'manual' THEN 1
+                    WHEN 'procedure' THEN 2
+                    WHEN 'guideline' THEN 3
+                    WHEN 'form' THEN 4
+                    ELSE 5
+                END,
+                (substring(doc_type_code from '\\d+'))::int,
+                doc_type_code,
+                display_code
         """
         df = run_query(sql, (cat_filter, std_filter))
         st.caption(f"{len(df)}건 표시")
@@ -179,72 +189,221 @@ elif page.startswith("2"):
         st.subheader("사용자 목록")
         st.dataframe(
             run_query("""
-                SELECT a.application_id AS "No", a.std_code_normalized AS std_code, a.sector_code,
+                SELECT a.application_id AS "No", a.std_code_normalized AS std_code,
+                       substring(a.sector_code from 1 for 1) AS "산업",
+                       CASE WHEN length(a.sector_code) >= 4
+                            THEN a.sector_code END AS "업종",
+                       CASE WHEN a.profile_id IS NOT NULL
+                            THEN a.sector_code || lpad(sp.profile_seq::text, 2, '0') END AS "프로필",
                        c.company_name AS "Company_name", a.sample_name AS "Sample_name",
                        c.biz_reg_no AS "Biz_reg_No", a.sample_original AS "Original",
                        a.org_scale AS "Org.scale", a.status AS "Status", a.created_at
                 FROM application a
                 LEFT JOIN company c ON c.company_id = a.company_id
+                LEFT JOIN sector_profile sp ON sp.profile_id = a.profile_id
                 ORDER BY a.application_id DESC
             """),
             use_container_width=True,
         )
 
+        with st.expander("🗑 잘못 등록한 신청건 삭제"):
+            del_apps = fetch_options(
+                "SELECT application_id, application_id || ' - ' || project_no "
+                "FROM application ORDER BY application_id DESC"
+            )
+            if not del_apps:
+                st.caption("삭제할 신청건이 없습니다.")
+            else:
+                del_choice = st.selectbox(
+                    "삭제할 신청건 선택", del_apps, format_func=lambda x: x[1], key="del_app_choice"
+                )
+                confirm_del = st.checkbox("정말 삭제하시겠습니까? (되돌릴 수 없습니다)", key="del_app_confirm")
+                if st.button("삭제", key="del_app_btn", disabled=not confirm_del):
+                    try:
+                        run_write("DELETE FROM application WHERE application_id = %s", (del_choice[0],))
+                        st.success(f"{del_choice[1]} 삭제되었습니다.")
+                        st.rerun()
+                    except Exception as e:
+                        if "foreign key" in str(e).lower():
+                            st.error(
+                                "이미 이 신청건과 연결된 조직도·문서 데이터가 있어 삭제할 수 없습니다. "
+                                "먼저 연결된 데이터를 정리한 뒤 다시 시도해주세요."
+                            )
+                        else:
+                            st.error(f"삭제 중 오류: {e}")
+
         st.divider()
-        st.subheader("새 사용자 등록")
+        st.subheader("사용자 등록 / 수정 / 복사")
 
-        source_kind = st.radio("등록 종류 *", ["실제 회사", "샘플"], horizontal=True, key="user_reg_kind")
-        sector_level = st.radio(
-            "업종 분류 수준 * — 정확한 분류가 어려우면 상위 단계로 한정할 수 있습니다",
-            ["세부 프로필까지 특정 가능", "업종코드까지만 특정 가능", "대분류까지만 특정 가능"],
-            key="user_reg_sector_level",
+        load_targets = fetch_options(
+            "SELECT application_id, application_id || ' - ' || project_no "
+            "FROM application ORDER BY application_id DESC"
+        )
+        source_choice = st.selectbox(
+            "불러올 신청건 선택 — 고르면 아래 양식에 그 내용이 채워집니다",
+            [(None, "— 새로 등록(빈 양식) —")] + load_targets,
+            format_func=lambda x: x[1],
+            key="load_app_choice",
         )
 
-        profiles = fetch_options(
-            "SELECT profile_id, sector_code || ' - ' || sector_name || ' (seq ' || profile_seq || ')' "
-            "FROM sector_profile ORDER BY sector_code, profile_seq"
+        action_mode = "new"
+        if source_choice and source_choice[0]:
+            mode_label = st.radio(
+                "이 신청건을",
+                ["수정(덮어쓰기)", "복사해서 새로 등록"],
+                horizontal=True,
+                key="load_app_mode",
+            )
+            action_mode = "edit" if mode_label.startswith("수정") else "copy"
+
+        source_id = source_choice[0] if (source_choice and source_choice[0]) else None
+        editing_id = source_id if action_mode == "edit" else None
+        key_tag = f"{source_id}_{action_mode}" if source_id else "new"
+
+        existing = None
+        if source_id:
+            existing = run_query(
+                """
+                SELECT a.*, c.company_name, c.biz_reg_no
+                FROM application a LEFT JOIN company c ON c.company_id = a.company_id
+                WHERE a.application_id = %s
+                """,
+                (source_id,),
+            ).iloc[0]
+            if action_mode == "edit":
+                st.info(f"'{existing['project_no']}' 신청건을 불러왔습니다. 내용을 고친 뒤 저장하세요.")
+            else:
+                st.info(
+                    f"'{existing['project_no']}' 신청건 내용을 복사했습니다. "
+                    "필요한 부분만 고쳐서 '신규 등록'하면 새 신청건이 만들어집니다(원본은 그대로 남습니다)."
+                )
+
+        default_kind = "실제 회사"
+        if existing is not None and pd.notna(existing.get("sample_name")):
+            default_kind = "샘플"
+        source_kind = st.radio(
+            "등록 종류 *", ["실제 회사", "샘플"], horizontal=True,
+            index=["실제 회사", "샘플"].index(default_kind),
+            key=f"user_reg_kind_{key_tag}",
         )
-        sector_codes = run_query(
-            "SELECT DISTINCT sector_code FROM sector_profile ORDER BY sector_code"
-        )["sector_code"].tolist()
+
+        st.markdown(
+            "**산업 / 업종 / 프로필** — 산업(대분류)은 필수이고, 정확히 아실수록 업종·프로필까지 "
+            "추가로 좁혀서 선택할 수 있습니다(둘 다 선택)."
+        )
         sector_mains = fetch_options("SELECT code, code || ' - ' || name FROM sector_main ORDER BY code")
-        orgs = fetch_options("SELECT org_chart_id, org_chart_name FROM org_chart ORDER BY org_chart_name")
-
-        with st.form("add_user"):
-            if source_kind == "실제 회사":
-                company_name_in = st.text_input("회사명 *")
-                biz_reg_no_in = st.text_input("사업자등록번호 * (예: 111-11-11111, 이미 등록된 번호면 그 회사에 신청건만 추가됩니다)")
-                sample_name_in, sample_original_in = "", ""
-            else:
-                sample_name_in = st.text_input("샘플명 *")
-                sample_original_in = st.text_input("Original * (샘플 입수 소스명, 예: itcpass)")
-                company_name_in, biz_reg_no_in = "", ""
-
-            std_choice = st.selectbox("규격 선택 *", STD_COMBOS, format_func=lambda x: f"{x[0]} — {x[1]}")
-
-            profile_choice = sector_code_choice = sector_main_choice = None
-            if sector_level.startswith("세부"):
-                if profiles:
-                    profile_choice = st.selectbox("업종 프로필 *", profiles, format_func=lambda x: x[1])
-                else:
-                    st.warning("등록된 업종 프로필이 없습니다.")
-            elif sector_level.startswith("업종코드"):
-                if sector_codes:
-                    sector_code_choice = st.selectbox("업종코드 *", sector_codes)
-                else:
-                    st.warning("등록된 업종코드가 없습니다.")
-            else:
-                if sector_mains:
-                    sector_main_choice = st.selectbox("대분류 *", sector_mains, format_func=lambda x: x[1])
-                else:
-                    st.warning("등록된 대분류가 없습니다.")
-
-            org_scale_choice = st.selectbox("직원수 규모(Org.scale) *", ORG_SCALE_OPTIONS)
-            org_choice = st.selectbox(
-                "조직도 (선택)", [(None, "— 선택 안 함 —")] + orgs, format_func=lambda x: x[1]
+        default_main_idx = 0
+        if existing is not None and sector_mains:
+            existing_main = str(existing["sector_code"])[:1]
+            main_ids = [x[0] for x in sector_mains]
+            if existing_main in main_ids:
+                default_main_idx = main_ids.index(existing_main)
+        if not sector_mains:
+            st.warning("등록된 산업(대분류)이 없습니다.")
+            sector_main_choice = None
+        else:
+            sector_main_choice = st.selectbox(
+                "산업(대분류) *", sector_mains, format_func=lambda x: x[1],
+                index=default_main_idx, key=f"user_reg_main_{key_tag}",
             )
 
-            if st.form_submit_button("등록"):
+        iaf_options = []
+        if sector_main_choice:
+            iaf_options = fetch_options(
+                "SELECT DISTINCT sector_code, sector_code || ' - ' || sector_name "
+                "FROM sector_profile WHERE sector_main = %s ORDER BY sector_code",
+                (sector_main_choice[0],),
+            )
+        default_iaf_idx = 0
+        if existing is not None and len(str(existing["sector_code"])) >= 4:
+            iaf_ids = [None] + [x[0] for x in iaf_options]
+            if existing["sector_code"] in iaf_ids:
+                default_iaf_idx = iaf_ids.index(existing["sector_code"])
+        iaf_choice = st.selectbox(
+            "업종(업종코드) — 선택",
+            [(None, "— 선택 안 함 —")] + iaf_options,
+            format_func=lambda x: x[1],
+            index=default_iaf_idx,
+            key=f"user_reg_iaf_{key_tag}",
+            disabled=not sector_main_choice,
+        )
+
+        profile_options = []
+        if iaf_choice and iaf_choice[0]:
+            profile_options = fetch_options(
+                "SELECT profile_id, 'seq ' || profile_seq || CASE WHEN is_default THEN ' (기본)' ELSE '' END "
+                "FROM sector_profile WHERE sector_code = %s ORDER BY profile_seq",
+                (iaf_choice[0],),
+            )
+        default_profile_idx = 0
+        if existing is not None and pd.notna(existing.get("profile_id")):
+            profile_ids = [None] + [x[0] for x in profile_options]
+            if int(existing["profile_id"]) in profile_ids:
+                default_profile_idx = profile_ids.index(int(existing["profile_id"]))
+        profile_choice = st.selectbox(
+            "프로필(세부) — 선택",
+            [(None, "— 선택 안 함 —")] + profile_options,
+            format_func=lambda x: x[1],
+            index=default_profile_idx,
+            key=f"user_reg_profile_{key_tag}",
+            disabled=not (iaf_choice and iaf_choice[0]),
+        )
+
+        orgs = fetch_options("SELECT org_chart_id, org_chart_name FROM org_chart ORDER BY org_chart_name")
+
+        with st.form(f"add_user_{key_tag}"):
+            if source_kind == "실제 회사":
+                company_name_in = st.text_input(
+                    "회사명 *", value="" if existing is None else (existing.get("company_name") or "")
+                )
+                biz_reg_no_in = st.text_input(
+                    "사업자등록번호 * (예: 111-11-11111, 이미 등록된 번호면 그 회사에 신청건만 추가됩니다)",
+                    value="" if existing is None else (existing.get("biz_reg_no") or ""),
+                )
+                sample_name_in, sample_original_in = "", ""
+            else:
+                sample_name_in = st.text_input(
+                    "샘플명 *", value="" if existing is None else (existing.get("sample_name") or "")
+                )
+                sample_original_in = st.text_input(
+                    "Original * (샘플 입수 소스명, 예: itcpass)",
+                    value="" if existing is None else (existing.get("sample_original") or ""),
+                )
+                company_name_in, biz_reg_no_in = "", ""
+
+            std_ids = [x[0] for x in STD_COMBOS]
+            default_std_idx = (
+                std_ids.index(existing["std_code_normalized"])
+                if existing is not None and existing["std_code_normalized"] in std_ids
+                else 0
+            )
+            std_choice = st.selectbox(
+                "규격 선택 *", STD_COMBOS, format_func=lambda x: f"{x[0]} — {x[1]}", index=default_std_idx
+            )
+
+            default_scale_idx = (
+                ORG_SCALE_OPTIONS.index(existing["org_scale"])
+                if existing is not None and existing.get("org_scale") in ORG_SCALE_OPTIONS
+                else 0
+            )
+            org_scale_choice = st.selectbox(
+                "직원수 규모(Org.scale) *", ORG_SCALE_OPTIONS, index=default_scale_idx
+            )
+
+            org_ids = [None] + [x[0] for x in orgs]
+            default_org_idx = (
+                org_ids.index(int(existing["org_chart_id"]))
+                if existing is not None and pd.notna(existing.get("org_chart_id"))
+                   and int(existing["org_chart_id"]) in org_ids
+                else 0
+            )
+            org_choice = st.selectbox(
+                "조직도 (선택)", [(None, "— 선택 안 함 —")] + orgs, format_func=lambda x: x[1],
+                index=default_org_idx,
+            )
+
+            submit_label = "수정 저장" if action_mode == "edit" else "신규 등록"
+            if st.form_submit_button(submit_label):
                 errors = []
                 if source_kind == "실제 회사":
                     if not company_name_in.strip():
@@ -259,12 +418,8 @@ elif page.startswith("2"):
                     if not sample_original_in.strip():
                         errors.append("Original(샘플 소스명)은 필수입니다.")
 
-                if sector_level.startswith("세부") and not profile_choice:
-                    errors.append("업종 프로필을 선택해주세요.")
-                elif sector_level.startswith("업종코드") and not sector_code_choice:
-                    errors.append("업종코드를 선택해주세요.")
-                elif sector_level.startswith("대분류") and not sector_main_choice:
-                    errors.append("대분류를 선택해주세요.")
+                if not sector_main_choice:
+                    errors.append("산업(대분류)을 선택해주세요.")
 
                 if errors:
                     for msg in errors:
@@ -274,7 +429,7 @@ elif page.startswith("2"):
                     active_stds = STD_TOKENS[std_norm]
                     profile_id = None
 
-                    if sector_level.startswith("세부"):
+                    if profile_choice and profile_choice[0]:
                         profile_id = profile_choice[0]
                         row = run_query(
                             "SELECT sector_code, profile_seq FROM sector_profile WHERE profile_id = %s",
@@ -283,19 +438,33 @@ elif page.startswith("2"):
                         sector_code = row.iloc[0]["sector_code"]
                         profile_seq = int(row.iloc[0]["profile_seq"])
                         sector_suffix = f"{sector_code}{profile_seq:02d}"
-                    elif sector_level.startswith("업종코드"):
-                        sector_code = sector_code_choice
+                    elif iaf_choice and iaf_choice[0]:
+                        sector_code = iaf_choice[0]
                         sector_suffix = sector_code
                     else:
                         sector_code = sector_main_choice[0]
                         sector_suffix = sector_code
 
                     if source_kind == "실제 회사":
-                        existing = run_query(
+                        match = run_query(
                             "SELECT company_id FROM company WHERE biz_reg_no = %s", (biz_reg_no_in.strip(),)
                         )
-                        if len(existing):
-                            company_id = int(existing.iloc[0]["company_id"])
+                        if len(match):
+                            company_id = int(match.iloc[0]["company_id"])
+                            if editing_id and pd.notna(existing.get("company_id")) \
+                                    and int(existing["company_id"]) == company_id:
+                                run_write(
+                                    "UPDATE company SET company_name = %s WHERE company_id = %s",
+                                    (company_name_in.strip(), company_id),
+                                )
+                        elif editing_id and pd.notna(existing.get("company_id")):
+                            # 수정 모드이고 사업자등록번호를 새 값으로 바꾼 경우: 기존에 연결된
+                            # 회사 레코드 자체를 갱신(같은 회사의 다른 신청건들도 함께 갱신됨).
+                            company_id = int(existing["company_id"])
+                            run_write(
+                                "UPDATE company SET company_name = %s, biz_reg_no = %s WHERE company_id = %s",
+                                (company_name_in.strip(), biz_reg_no_in.strip(), company_id),
+                            )
                         else:
                             conn = _engine_conn()
                             with conn:
@@ -316,20 +485,46 @@ elif page.startswith("2"):
 
                     project_no = f"{std_norm}{sector_suffix}_{name_for_project_no}"
 
-                    run_write(
-                        """
-                        INSERT INTO application
-                            (company_id, sample_name, sample_original, project_no,
-                             std_code_normalized, active_stds, sector_code, profile_id,
-                             org_chart_id, org_scale)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        """,
-                        (company_id, sample_name_val, sample_original_val, project_no,
-                         std_norm, json.dumps(active_stds, ensure_ascii=False), sector_code, profile_id,
-                         org_choice[0], org_scale_choice),
-                    )
-                    st.success(f"등록되었습니다. (project_no: {project_no})")
-                    st.rerun()
+                    try:
+                        if editing_id:
+                            run_write(
+                                """
+                                UPDATE application SET
+                                    company_id = %s, sample_name = %s, sample_original = %s,
+                                    project_no = %s, std_code_normalized = %s, active_stds = %s,
+                                    sector_code = %s, profile_id = %s, org_chart_id = %s, org_scale = %s
+                                WHERE application_id = %s
+                                """,
+                                (company_id, sample_name_val, sample_original_val, project_no,
+                                 std_norm, json.dumps(active_stds, ensure_ascii=False), sector_code, profile_id,
+                                 org_choice[0], org_scale_choice, editing_id),
+                            )
+                            st.success(f"수정되었습니다. (project_no: {project_no})")
+                        else:
+                            run_write(
+                                """
+                                INSERT INTO application
+                                    (company_id, sample_name, sample_original, project_no,
+                                     std_code_normalized, active_stds, sector_code, profile_id,
+                                     org_chart_id, org_scale)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                """,
+                                (company_id, sample_name_val, sample_original_val, project_no,
+                                 std_norm, json.dumps(active_stds, ensure_ascii=False), sector_code, profile_id,
+                                 org_choice[0], org_scale_choice),
+                            )
+                            st.success(f"등록되었습니다. (project_no: {project_no})")
+                        st.session_state.pop("load_app_choice", None)
+                        st.session_state.pop("load_app_mode", None)
+                        st.rerun()
+                    except Exception as e:
+                        if "duplicate key" in str(e).lower():
+                            st.error(
+                                "이미 같은 project_no(규격+업종+이름 조합)를 가진 신청건이 있습니다. "
+                                "복사한 경우라면 규격·업종·이름 중 하나를 바꿔서 다시 시도해주세요."
+                            )
+                        else:
+                            st.error(f"저장 중 오류: {e}")
 
     elif sub.startswith("조직도"):
         st.subheader("조직도 목록")
