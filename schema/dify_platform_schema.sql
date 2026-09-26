@@ -1,415 +1,2045 @@
 -- ============================================================
--- 경영시스템문서 플랫폼 — 전체 DB 스키마 DDL (3순위 설계 결과물, 재검토 반영)
--- 대상: Cloud SQL PostgreSQL 인스턴스 ims-doc-instance (asia-northeast3, PG 18.4)
--- 작성일: 2026-08-17
--- 재검토1: 2026-08-18(한글SDK 확인 결과 반영, hwp_render_job 추가)
--- 재검토2: 2026-08-18(출력형식 요구사항 수정 — 병행X, 원본(HWP)+요청시 전환프로젝트
---          구조로 확정. application.project_no, conversion_project 테이블 추가)
--- (2026-08-23 지침서 관련 재검토3·4는 사용자 요청으로 되돌림 — 절차서까지
---  완성된 상태로 복귀했다가, 작성기준_r5 검토·협의를 거쳐 재검토5로 재반영)
--- 재검토5: 2026-08-24(작성기준_r5 기준 지침서=3레벨 문서 최종 확정 반영.
---          doc_type에 중분류/세분류/표기번호 컬럼 추가, guideline_item 추가,
---          document_integrated에 bundle_scope 추가로 절차서·지침서 통합본 분리)
--- 재검토6: 2026-08-24(작성기준_r7 기준 프로젝트제목 생성규칙 확정 — 소문자,
---          {std_code}{sector_code}{profile_seq 2자리}_{소스구분}{No}(소스명)|회사명.
---          application.project_no 규칙 갱신, sector_profile.profile_seq 추가,
---          doc_type에 원본추적용 source_project_title/source_original 추가)
--- 재검토7: 2026-08-24(샘플 문서 분석 워크플로우 — 4번째 워크플로우로 재도입.
---          sample_project_analysis/sample_doc_classification 테이블 추가:
---          ①프로젝트제목 도출(업종코드+profile_seq), ②절차서/지침서 구분 판정을
---          LLM 1차 판정 → 사람 검토 후 확정하는 감사로그 구조)
--- 실행 시점: 4순위 Streamlit 앱 1차 작업에서 DBeaver/psql로 실행
+-- dify_platform_schema.sql — 경영시스템문서 플랫폼 통합 스키마 (2026-09-13 기준)
+--
+-- 이 파일은 로컬 PostgreSQL 16 테스트 DB(기존 base 스키마 + 06/08순 조직·책임과 권한
+-- 마이그레이션 + 이번 회차 4순위 최종단계 "문서관리" 마이그레이션까지 전부 적용된 상태)에서
+-- pg_dump --schema-only로 그대로 추출한 최신 스냅샷입니다. 총 34개 테이블.
+--
+-- 신규 설치 시: 이 파일 하나로 전체 스키마를 만들 수 있습니다(seed 데이터는 별도 —
+-- dify_doc_type_seed.sql 등 프로젝트의 시드 스크립트를 이어서 실행하세요).
+-- 기존 운영 DB(이미 데이터가 있는 Cloud SQL 등)에는 이 파일을 그대로 실행하지 말고,
+-- scripts/10_migrate_doc_management.py처럼 컬럼 존재 여부를 확인하는 멱등 마이그레이션
+-- 스크립트로 반영하세요.
 -- ============================================================
 
--- ---------- 영역 1. 기준정보 ----------
-
-CREATE TABLE standard (
-    std_code    varchar(4) PRIMARY KEY,        -- 'q','e','hs'
-    iso_num     varchar(20) NOT NULL,           -- 'ISO 9001'
-    title       varchar(50) NOT NULL,           -- '품질경영시스템'
-    prefix      varchar(4) NOT NULL             -- 'Q'
-);
-
-CREATE TABLE sector_main (
-    code        char(1) PRIMARY KEY,            -- M,U,C,S,I,E
-    name        varchar(50) NOT NULL
-);
-
-CREATE TABLE iaf_group (
-    iaf_num     varchar(2) PRIMARY KEY,
-    name        varchar(100) NOT NULL
-);
-
-CREATE TABLE company (
-    company_id      bigserial PRIMARY KEY,
-    company_name    varchar(200) NOT NULL,
-    biz_reg_no      varchar(20) UNIQUE,     -- '111-11-11111' 형식(앱단 검증), 중복등록불가(수정검토1.6)
-    created_at      timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE TABLE sector_profile (
-    profile_id              bigserial PRIMARY KEY,
-    sector_code             varchar(10) NOT NULL,          -- 'M17f'
-    profile_seq             smallint NOT NULL,             -- 같은 sector_code 내 프로필 순번(1~99). 프로젝트제목(작성기준_r7)에
-                                                             -- sector_code 뒤에 2자리 zero-pad로 이어붙임(예: M01a01) — 파싱 모호함 방지 위해 항상 2자리 고정.
-    sector_main             char(1) NOT NULL REFERENCES sector_main(code),
-    iaf_num                 varchar(2) NOT NULL REFERENCES iaf_group(iaf_num),
-    sector_detail           char(1) NOT NULL,
-    sector_name             varchar(200) NOT NULL,
-    is_default              boolean NOT NULL DEFAULT false,
-    hazards                 jsonb NOT NULL DEFAULT '[]',
-    env_aspects              jsonb NOT NULL DEFAULT '[]',
-    quality_chars            jsonb NOT NULL DEFAULT '[]',
-    key_laws_sh              jsonb NOT NULL DEFAULT '[]',
-    key_laws_env              jsonb NOT NULL DEFAULT '[]',
-    process_hints             jsonb NOT NULL DEFAULT '[]',
-    source_type               varchar(20) NOT NULL DEFAULT 'iaf_csv',  -- 'iaf_csv' | 'custom'
-    created_by_company_id     bigint REFERENCES company(company_id),
-    created_at                 timestamptz NOT NULL DEFAULT now(),
-    CHECK (profile_seq BETWEEN 1 AND 99),
-    UNIQUE (sector_code, profile_seq)
-);
-CREATE INDEX idx_sector_profile_code ON sector_profile(sector_code);
-
--- form_pattern: 양식(category='form') 자동화 디자인 패턴 참조테이블(2026-08-25 추가).
--- CHECK enum 대신 별도 테이블로 분리한 이유: 현재 4개 패턴은 소량 샘플로 검토한 잠정 분류이며,
--- 4순위 이후 양식 샘플이 더 확보되면 최종 패턴이 추가/조정될 예정 — 그때 스키마 변경(ALTER) 없이
--- 이 테이블에 행만 추가/수정하면 되도록 확장 가능하게 설계.
-CREATE TABLE form_pattern (
-    pattern_code   varchar(30) PRIMARY KEY,   -- 'register_log' 등
-    pattern_name   varchar(100) NOT NULL,     -- '등록대장류'
-    description    text                       -- 패턴 판별 기준 설명
-);
-
-CREATE TABLE doc_type (
-    doc_type_id       bigserial PRIMARY KEY,
-    doc_type_code     varchar(30) UNIQUE NOT NULL,   -- 'P610', 'P812(HS-1)', 'P810-01' 등 — doc_type_master 엑셀의 코드 그대로 사용(마스터, STD무관, QEHS 접두어 없음)
-    doc_type_name     varchar(100) NOT NULL,         -- '리스크 및 기회관리'
-    category          varchar(20) NOT NULL,          -- 'manual' | 'procedure' | 'form' | 'guideline'(2026-08-24 추가, 작성기준_r5)
-    applicable_std    jsonb NOT NULL,                -- ['q','e','hs']
-    applicable_label  varchar(30),                   -- '공통(순수)' | '공통(고유조항포함)' | 'Q전용' | 'E전용' | 'HS전용' | 'EHS통합전용' — doc_type_master의 "적용구분" 컬럼 그대로(사람이 읽는 분류, applicable_std로 완전히 유도되지 않는 정보 포함)
-    is_mandatory      boolean NOT NULL DEFAULT true,
-    clause_ref        varchar(20),                   -- '6.1.2' 등 doc_type_master의 "관련 ISO 조항"
-    remark            text,                          -- doc_type_master의 "비고" — 코드 충돌 사유, 분류 근거 등 설계 메모 보존
-    -- 아래 4개 컬럼은 category='guideline'인 행에만 채움(작성기준_r5, 2026-08-24 추가)
-    subcategory        varchar(10),                  -- 중분류: '안전'|'보건'|'기술'|'생산'|'작업'|'품질'|'환경' 등
-    subcategory_group  varchar(30),                  -- 세분류명: '일반작업안전' 등 (중분류를 한 단계 더 나눈 그룹)
-    subcategory_letter char(1),                       -- 세분류문자: 세분류 그룹별 A,B,C... 부여
-    display_code        varchar(20),                  -- 지침서 실제 문서 표기번호(규정번호 비노출): 예 'SI-A01' = 중분류이니셜(S)+I(지침서)-세분류문자+일련번호
-    -- 아래 2개 컬럼은 원본 추적용(작성기준_r7, 2026-08-24 추가) — 이 doc_type 항목이 어느 샘플/원본에서 파생됐는지 기록
-    source_project_title varchar(120),                -- 프로젝트제목(작성기준_r7 생성규칙, 소문자). 예: 'qm01a01_s01(itcpass)'
-    source_original       varchar(120),                -- Original(원본출처) — 해당 샘플 소스 내 원본 문서 고유번호. 예: 'WJS-AF-01'
-    -- 아래 1개 컬럼은 category='form'인 행에만 채움(2026-08-25 추가) — form_pattern 참조, 잠정 분류이므로 nullable
-    form_pattern_code    varchar(30) REFERENCES form_pattern(pattern_code)
-);
-
--- ---------- 영역 1-보조. 샘플 문서 분석 (2026-08-24 추가, 4번째 워크플로우) ----------
--- 회사가 보유한 기존 경영시스템 문서(풀버전 통합본 포함)를 업로드하면, 사람이 매번
--- 직접 판단하지 않아도 되도록 두 가지를 LLM이 1차 판정하고 사람이 검토·승인하는 구조.
--- ① 프로젝트제목 도출: 문서에서 회사개요·적용범위 등 짧은 발췌만 뽑고(전체를 읽지 않음),
---    sector_profile의 hazards/quality_chars/process_hints 키워드와 매칭해 후보를 4~8개로
---    압축한 뒤, 그 후보+발췌만 LLM에 줘서 최종 sector_code+profile_seq를 판정한다.
--- ② 절차서/지침서 구분: 통합본에 섞여 있는 개별 문서마다, "조직적 승인·검토·기록 절차의
---    유무"라는 확립된 기준을 few-shot으로 주고 LLM이 절차서/지침서와 판정근거를 낸다.
--- 두 판정 모두 reviewed=false로 감사로그에 남고, 사람이 검토·승인해야(Streamlit, 5~6순위)
--- 실제 sector_profile 연결(application.profile_id)이나 doc_type_master 반영으로 이어진다.
-CREATE TABLE sample_project_analysis (      -- ① 프로젝트제목 도출 판정 로그
-    analysis_id          bigserial PRIMARY KEY,
-    source_file_name       varchar(255) NOT NULL,     -- 분석 대상 원본 파일명
-    excerpt_text              text,                       -- 1단계: 회사개요/적용범위 등 발췌 텍스트(전체 문서 아님)
-    candidate_profile_ids       jsonb,                      -- 2단계: 키워드 매칭으로 좁힌 후보 profile_id 배열(LLM 미사용)
-    matched_keywords               jsonb,                      -- 매칭에 쓰인 키워드(hazards/quality_chars/process_hints 교집합)
-    llm_sector_code                     varchar(10),               -- 3단계: LLM 최종 판정 sector_code
-    llm_profile_seq                       smallint,                  -- 3단계: LLM 최종 판정 profile_seq
-    llm_reasoning                           text,                      -- 판정근거
-    reviewed                                  boolean NOT NULL DEFAULT false,
-    resulting_profile_id                        bigint REFERENCES sector_profile(profile_id),  -- 승인 후 실제 연결
-    created_at                                    timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE TABLE sample_doc_classification (    -- ② 절차서/지침서 구분 판정 로그
-    classification_id     bigserial PRIMARY KEY,
-    analysis_id             bigint REFERENCES sample_project_analysis(analysis_id),  -- 같은 문서 세트 분석에 소속(선택)
-    doc_title                 varchar(200) NOT NULL,
-    doc_excerpt                 text,
-    llm_category                   varchar(20),           -- 'procedure' | 'guideline' 판정
-    llm_reasoning                     text,                  -- 판정근거(승인·검토·기록 절차 유무 등)
-    reviewed                            boolean NOT NULL DEFAULT false,
-    resulting_doc_type_id                  bigint REFERENCES doc_type(doc_type_id),  -- 승인 후 실제 연결
-    created_at                              timestamptz NOT NULL DEFAULT now()
-);
-
--- ---------- 영역 3. 조직도 (application보다 먼저 정의 — FK 순서) ----------
-
-CREATE TABLE org_chart (
-    org_chart_id        bigserial PRIMARY KEY,
-    org_chart_name       varchar(200) NOT NULL,
-    industry_tag          varchar(50),
-    company_size_tag       varchar(20),             -- 10인미만/10~49인/50~99인/100~299인/300~999인/1000인이상
-                                                      -- (수정검토1.6, 기존 micro/small/medium/large에서 변경)
-    source_company_id       bigint REFERENCES company(company_id),
-    is_template               boolean NOT NULL DEFAULT true,
-    created_at                 timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE TABLE org_chart_role (
-    role_id         bigserial PRIMARY KEY,
-    org_chart_id    bigint NOT NULL REFERENCES org_chart(org_chart_id),
-    role_name       varchar(100) NOT NULL,     -- '품질경영팀장'
-    department      varchar(100),
-    parent_role_id  bigint REFERENCES org_chart_role(role_id),
-    seq             int NOT NULL DEFAULT 0
-);
-
--- ---------- 영역 2. 신청 건 ----------
-
-CREATE TABLE application (
-    application_id      bigserial PRIMARY KEY,
-    company_id           bigint REFERENCES company(company_id),   -- nullable로 변경(수정검토1.6) — 샘플 등록 시 NULL
-    sample_name            varchar(200),    -- 수정검토1.6 추가 — 샘플 등록 시 사용(company_id와 양자택일)
-    sample_original           varchar(300),    -- 수정검토1.6 추가 — 샘플 원본 소스명(project_no의 소스명과 대응, 예: 'itcpass')
-    org_scale                   varchar(20),     -- 수정검토1.6 추가 — 등록 시점의 직원수 규모(10인미만~1000인이상 6단계).
-                                                   -- org_chart는 이 시점에 아직 없을 수 있어 application에 우선 기록하고,
-                                                   -- 이후 조직도 생성 시 org_chart.company_size_tag로 옮겨 씀.
-    project_no             varchar(120) UNIQUE NOT NULL,  -- 프로젝트제목 생성규칙(작성기준_r7, 2026-08-24 확정, 소문자):
-                                                            -- {std_code 소문자}{sector_code}{profile_seq 2자리}_{소스구분}{No 2자리}({소스명}) | 회사명
-                                                            -- 소스구분: s=기존외부소싱샘플 n=신규내부제작샘플 x=기존내부보유 (없음)=신규내부제작(실제 회사)
-                                                            -- 예: qm01a01_s01(itcpass), qehsc82f01_경영시스템주식회사. 애플리케이션(백엔드)에서 생성해 채움, 원본(HWP) 프로젝트는 접미사 없음
-    std_code_normalized    varchar(4) NOT NULL,     -- 'q'|'e'|'hs'|'qe'|'qhs'|'ehs'|'qehs' 7종 그대로 저장
-    active_stds              jsonb NOT NULL,          -- ['q','e','hs'] 형태 배열 — doc_type 매칭용
-    sector_code                 varchar(10) NOT NULL,   -- 전체(M17f) | 업종코드만(M17) | 대분류만(M) 중 확인 가능한 수준까지(수정검토1.6)
-    profile_id                    bigint REFERENCES sector_profile(profile_id),
-    org_chart_id                    bigint REFERENCES org_chart(org_chart_id),
-    status                            varchar(20) NOT NULL DEFAULT 'in_progress',
-    created_at                         timestamptz NOT NULL DEFAULT now(),
-    CHECK (
-        (company_id IS NOT NULL AND sample_name IS NULL)
-        OR (company_id IS NULL AND sample_name IS NOT NULL)
-    )
-);
-
--- ---------- 영역 2-보조. 전환 프로젝트 (3순위 재검토 2차, 2026-08-18 추가) ----------
--- 한글(HWP)이 원본이며 application 자체가 원본 프로젝트다(project_no에 접미사 없음).
--- 엑셀/워드 전환본은 "병행 생성"이 아니라, 원본 완성 후 필요할 때 사용자가 별도로
--- 요청해서 만드는 "전환 프로젝트"다. process_step/org_chart/책임과 권한 등 콘텐츠
--- 생성 테이블은 전환 프로젝트에서 중복 생성하지 않는다 — 내용은 원본 그대로이고
--- 파일 형식만 바뀌기 때문. 전환 대상 범위는 전체(매뉴얼+절차서 전 문서).
-CREATE TABLE conversion_project (
-    conversion_id       bigserial PRIMARY KEY,
-    application_id       bigint NOT NULL REFERENCES application(application_id),  -- 원본(HWP) 프로젝트
-    project_no             varchar(120) UNIQUE NOT NULL,  -- 원본 project_no + '_Exl' 또는 '_Wrd'
-    format                    varchar(10) NOT NULL,          -- 'xlsx' | 'docx'
-    status                       varchar(20) NOT NULL DEFAULT 'requested',  -- requested|in_progress|done|failed
-    storage_root_path               varchar(500),
-    requested_at                       timestamptz NOT NULL DEFAULT now(),
-    completed_at                         timestamptz
-);
-CREATE INDEX idx_conversion_project_app ON conversion_project(application_id);
-
--- 통합규격(qe/qhs/ehs/qehs) 전용 테이블은 두지 않는다. std_code_normalized에
--- 조합 문자열을 그대로 저장하고, active_stds(개별 토큰 배열)로 doc_type을
--- 매칭한다. 예) 이 신청 건에 필요한 문서종류 조회:
 --
---   SELECT dt.* FROM doc_type dt, application a
---   WHERE a.application_id = :id
---     AND dt.applicable_std ?| ARRAY(SELECT jsonb_array_elements_text(a.active_stds));
+-- PostgreSQL database dump
 --
--- applicable_std가 ['q']뿐인 문서(품질 전용)는 std_code_normalized가 'qehs'여도
--- active_stds에 'q'가 포함되어 있으면 자동으로 걸린다 — 7가지 조합을 doc_type
--- 쪽에 미리 다 등록해 둘 필요가 없다.
 
--- ---------- 영역 4. 절차서 생성 결과 (v0.2 확장) ----------
 
-CREATE TABLE process_step (
-    step_id          bigserial PRIMARY KEY,
-    application_id   bigint NOT NULL REFERENCES application(application_id),
-    doc_type_id      bigint NOT NULL REFERENCES doc_type(doc_type_id),
-    pdca_stage       varchar(1) NOT NULL,     -- P/D/C/A
-    stage_seq        int NOT NULL,
-    step_name        varchar(200) NOT NULL,
-    clause_no        varchar(10),             -- '6.1'
-    created_at       timestamptz NOT NULL DEFAULT now()
+-- Dumped from database version 16.13 (Ubuntu 16.13-0ubuntu0.24.04.1)
+-- Dumped by pg_dump version 16.13 (Ubuntu 16.13-0ubuntu0.24.04.1)
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+SET default_tablespace = '';
+
+SET default_table_access_method = heap;
+
+--
+-- Name: application; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.application (
+    application_id bigint NOT NULL,
+    company_id bigint,
+    sample_name character varying(200),
+    org_scale character varying(20),
+    project_no character varying(120) NOT NULL,
+    std_code_normalized character varying(4) NOT NULL,
+    active_stds jsonb NOT NULL,
+    sector_code character varying(10) NOT NULL,
+    profile_id bigint,
+    org_chart_id bigint,
+    status character varying(20) DEFAULT 'in_progress'::character varying NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    org_rr_status character varying(20) DEFAULT '미시작'::character varying NOT NULL,
+    original_no smallint,
+    CONSTRAINT application_check CHECK ((((company_id IS NOT NULL) AND (sample_name IS NULL)) OR ((company_id IS NULL) AND (sample_name IS NOT NULL))))
 );
 
-CREATE TABLE process_step_io (
-    io_id       bigserial PRIMARY KEY,
-    step_id     bigint NOT NULL REFERENCES process_step(step_id),
-    io_type     varchar(10) NOT NULL,          -- 'input'|'output'
-    io_desc     varchar(300) NOT NULL
+
+--
+-- Name: application_application_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.application_application_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: application_application_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.application_application_id_seq OWNED BY public.application.application_id;
+
+
+--
+-- Name: company; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.company (
+    company_id bigint NOT NULL,
+    company_name character varying(200) NOT NULL,
+    biz_reg_no character varying(20),
+    created_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
-CREATE TABLE process_step_activity (
-    activity_id     bigserial PRIMARY KEY,
-    step_id         bigint NOT NULL REFERENCES process_step(step_id),
-    activity_desc   text NOT NULL,
-    seq             int NOT NULL DEFAULT 0
+
+--
+-- Name: company_company_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.company_company_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: company_company_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.company_company_id_seq OWNED BY public.company.company_id;
+
+
+--
+-- Name: conversion_project; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.conversion_project (
+    conversion_id bigint NOT NULL,
+    application_id bigint NOT NULL,
+    project_no character varying(120) NOT NULL,
+    format character varying(10) NOT NULL,
+    status character varying(20) DEFAULT 'requested'::character varying NOT NULL,
+    storage_root_path character varying(500),
+    requested_at timestamp with time zone DEFAULT now() NOT NULL,
+    completed_at timestamp with time zone
 );
 
-CREATE TABLE process_dependency (
-    dependency_id   bigserial PRIMARY KEY,
-    from_step_id    bigint NOT NULL REFERENCES process_step(step_id),
-    to_step_id      bigint NOT NULL REFERENCES process_step(step_id)
+
+--
+-- Name: conversion_project_conversion_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.conversion_project_conversion_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: conversion_project_conversion_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.conversion_project_conversion_id_seq OWNED BY public.conversion_project.conversion_id;
+
+
+--
+-- Name: dept_master; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.dept_master (
+    dept_code character varying(20) NOT NULL,
+    dept_name character varying(100) NOT NULL,
+    category_code character varying(20) NOT NULL,
+    category_name character varying(50) NOT NULL,
+    category_seq integer NOT NULL,
+    is_custom boolean DEFAULT false NOT NULL,
+    relevant_std jsonb
 );
 
-CREATE TABLE term_dictionary (
-    term_id         bigserial PRIMARY KEY,
-    std_code        varchar(4) NOT NULL,
-    term            varchar(100) NOT NULL,
-    definition      text NOT NULL,
-    source_clause   varchar(20)
+
+--
+-- Name: dept_responsibility; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.dept_responsibility (
+    resp_id bigint NOT NULL,
+    role_id bigint NOT NULL,
+    category character varying(10) NOT NULL,
+    seq integer DEFAULT 0 NOT NULL,
+    content text NOT NULL,
+    authority_criteria character varying(300),
+    related_step_id bigint,
+    basis_doc character varying(300),
+    required_competency character varying(300)
 );
 
-CREATE TABLE process_term_usage (
-    usage_id    bigserial PRIMARY KEY,
-    step_id     bigint NOT NULL REFERENCES process_step(step_id),
-    term_id     bigint NOT NULL REFERENCES term_dictionary(term_id)
+
+--
+-- Name: dept_responsibility_resp_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.dept_responsibility_resp_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: dept_responsibility_resp_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.dept_responsibility_resp_id_seq OWNED BY public.dept_responsibility.resp_id;
+
+
+--
+-- Name: doc_type; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.doc_type (
+    doc_type_id bigint NOT NULL,
+    doc_type_code character varying(30) NOT NULL,
+    doc_type_name character varying(100) NOT NULL,
+    category character varying(20) NOT NULL,
+    applicable_std jsonb NOT NULL,
+    applicable_label character varying(30),
+    is_mandatory boolean DEFAULT true NOT NULL,
+    clause_ref character varying(20),
+    remark text,
+    subcategory character varying(10),
+    subcategory_group character varying(30),
+    subcategory_letter character(1),
+    display_code character varying(20),
+    source_project_title character varying(120),
+    source_original character varying(120),
+    form_pattern_code character varying(30)
 );
 
-CREATE TABLE responsibility_matrix (
-    resp_id     bigserial PRIMARY KEY,
-    step_id     bigint NOT NULL REFERENCES process_step(step_id),
-    role_id     bigint NOT NULL REFERENCES org_chart_role(role_id),
-    resp_type   varchar(10) NOT NULL            -- '수행'|'검토'|'승인'
+
+--
+-- Name: doc_type_doc_type_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.doc_type_doc_type_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: doc_type_doc_type_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.doc_type_doc_type_id_seq OWNED BY public.doc_type.doc_type_id;
+
+
+--
+-- Name: document_content; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.document_content (
+    content_id bigint NOT NULL,
+    doc_id bigint NOT NULL,
+    extracted_at timestamp with time zone DEFAULT now() NOT NULL,
+    format character varying(10) DEFAULT 'hwp'::character varying NOT NULL,
+    storage_path character varying(500)
 );
 
--- ---------- 영역 4-보조. 지침서 생성 결과 (2026-08-24 추가, 작성기준_r5) ----------
--- 지침서는 절차서(process_step/responsibility_matrix)와 달리 PDCA·조직 승인 흐름이 없고,
--- "항목 제목·수치기준·작업방법·근거법규"를 나열하는 기술기준 목록 구조다. 생성 방식은
--- (1) 중분류/세분류/제목으로 방향 결정 → (2) 샘플 프레임(디자인)을 선택 → (3) 지침서내용샘플
--- (기존 확보 지침서 텍스트·이미지) + 제목 관련 주요특성을 입력으로 LLM이 본문을 작성하며,
--- 지식노드에 근거 법규 원문이 있으면 그 원문에서 수치기준을 가져와 정확도를 높이고,
--- 없으면 지침서내용샘플+주요특성만으로 작성하되 이 경우 사람 검토(needs_review)를 거친다.
-CREATE TABLE guideline_item (
-    item_id             bigserial PRIMARY KEY,
-    application_id      bigint NOT NULL REFERENCES application(application_id),
-    doc_type_id         bigint NOT NULL REFERENCES doc_type(doc_type_id),
-    item_title          varchar(200) NOT NULL,       -- 항목 제목
-    tech_standard        text,                          -- 수치기준(예: 조도 75~750lux)
-    work_method            text,                          -- 작업방법
-    source_regulation       varchar(200),                  -- 근거법규(산업안전보건기준에관한규칙 등)
-    content_source_type      varchar(20) NOT NULL DEFAULT 'sample',
-                                                            -- 'regulation'(지식노드 법규원문 기반) | 'sample'(지침서내용샘플+주요특성만 사용, 법규원문 없음)
-    needs_review              boolean NOT NULL DEFAULT false, -- content_source_type='sample'이면 true — 법규원문 대조 없이 생성되어 사람 검토 필요
-    created_at                  timestamptz NOT NULL DEFAULT now()
+
+--
+-- Name: document_content_content_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.document_content_content_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: document_content_content_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.document_content_content_id_seq OWNED BY public.document_content.content_id;
+
+
+--
+-- Name: document_individual; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.document_individual (
+    doc_id bigint NOT NULL,
+    application_id bigint NOT NULL,
+    conversion_project_id bigint,
+    doc_type_id bigint NOT NULL,
+    revision_no integer DEFAULT 1 NOT NULL,
+    format character varying(10) NOT NULL,
+    storage_path character varying(500),
+    status character varying(20) DEFAULT 'draft'::character varying NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    form_seq_no character varying(20),
+    CONSTRAINT document_individual_check CHECK ((((conversion_project_id IS NULL) AND ((format)::text = 'hwp'::text)) OR ((conversion_project_id IS NOT NULL) AND ((format)::text = ANY ((ARRAY['xlsx'::character varying, 'docx'::character varying])::text[])))))
 );
 
--- ---------- 영역 5. 양식 ----------
 
-CREATE TABLE form_template (
-    form_id         bigserial PRIMARY KEY,
-    application_id  bigint NOT NULL REFERENCES application(application_id),
-    step_id         bigint REFERENCES process_step(step_id),
-    form_name       varchar(200) NOT NULL
+--
+-- Name: document_individual_doc_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.document_individual_doc_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: document_individual_doc_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.document_individual_doc_id_seq OWNED BY public.document_individual.doc_id;
+
+
+--
+-- Name: document_integrated; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.document_integrated (
+    integrated_id bigint NOT NULL,
+    application_id bigint NOT NULL,
+    conversion_project_id bigint,
+    revision_no integer DEFAULT 1 NOT NULL,
+    format character varying(10) DEFAULT 'hwp'::character varying NOT NULL,
+    bundle_scope character varying(10) DEFAULT 'core'::character varying NOT NULL,
+    storage_path character varying(500),
+    composed_doc_ids jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    status character varying(20) DEFAULT 'draft'::character varying NOT NULL,
+    CONSTRAINT document_integrated_bundle_scope_check CHECK (((bundle_scope)::text = ANY ((ARRAY['core'::character varying, 'guideline'::character varying])::text[]))),
+    CONSTRAINT document_integrated_check CHECK ((((conversion_project_id IS NULL) AND ((format)::text = 'hwp'::text)) OR ((conversion_project_id IS NOT NULL) AND ((format)::text = ANY ((ARRAY['xlsx'::character varying, 'docx'::character varying])::text[])))))
 );
 
-CREATE TABLE form_field (
-    field_id    bigserial PRIMARY KEY,
-    form_id     bigint NOT NULL REFERENCES form_template(form_id),
-    field_name  varchar(100) NOT NULL,
-    field_type  varchar(20) NOT NULL,           -- text/date/number/signature 등
-    seq         int NOT NULL DEFAULT 0
+
+--
+-- Name: document_integrated_integrated_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.document_integrated_integrated_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: document_integrated_integrated_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.document_integrated_integrated_id_seq OWNED BY public.document_integrated.integrated_id;
+
+
+--
+-- Name: document_revision_log; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.document_revision_log (
+    log_id bigint NOT NULL,
+    doc_id bigint,
+    integrated_id bigint,
+    revision_no integer NOT NULL,
+    change_note text,
+    changed_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
--- ---------- 영역 5. 문서 보관 ----------
 
-CREATE TABLE document_individual (       -- 개별본
-    doc_id              bigserial PRIMARY KEY,
-    application_id      bigint NOT NULL REFERENCES application(application_id),
-    conversion_project_id  bigint REFERENCES conversion_project(conversion_id),  -- NULL=원본(HWP), 값 있으면 그 전환 프로젝트 소속 파일
-    doc_type_id         bigint NOT NULL REFERENCES doc_type(doc_type_id),
-    revision_no         int NOT NULL DEFAULT 1,
-    format              varchar(10) NOT NULL,        -- 'hwp'(원본) | 'xlsx'|'docx'(전환)
-    storage_path        varchar(500),
-    status              varchar(20) NOT NULL DEFAULT 'draft',
-    created_at          timestamptz NOT NULL DEFAULT now(),
-    CHECK (
-        (conversion_project_id IS NULL AND format = 'hwp')
-        OR (conversion_project_id IS NOT NULL AND format IN ('xlsx', 'docx'))
-    )
+--
+-- Name: document_revision_log_log_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.document_revision_log_log_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: document_revision_log_log_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.document_revision_log_log_id_seq OWNED BY public.document_revision_log.log_id;
+
+
+--
+-- Name: form_field; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.form_field (
+    field_id bigint NOT NULL,
+    form_id bigint NOT NULL,
+    field_name character varying(100) NOT NULL,
+    field_type character varying(20) NOT NULL,
+    seq integer DEFAULT 0 NOT NULL
 );
 
-CREATE TABLE document_content (          -- 내용본
-    content_id      bigserial PRIMARY KEY,
-    doc_id          bigint NOT NULL REFERENCES document_individual(doc_id),
-    content_text    text,
-    extracted_at    timestamptz NOT NULL DEFAULT now()
+
+--
+-- Name: form_field_field_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.form_field_field_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: form_field_field_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.form_field_field_id_seq OWNED BY public.form_field.field_id;
+
+
+--
+-- Name: form_pattern; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.form_pattern (
+    pattern_code character varying(30) NOT NULL,
+    pattern_name character varying(100) NOT NULL,
+    description text
 );
 
-CREATE TABLE document_integrated (       -- 통합본
-    integrated_id       bigserial PRIMARY KEY,
-    application_id       bigint NOT NULL REFERENCES application(application_id),
-    conversion_project_id  bigint REFERENCES conversion_project(conversion_id),  -- NULL=원본(HWP), 값 있으면 그 전환 프로젝트 소속
-    revision_no            int NOT NULL DEFAULT 1,
-    format                    varchar(10) NOT NULL DEFAULT 'hwp',  -- 'hwp'(원본) | 'xlsx'|'docx'(전환)
-    bundle_scope              varchar(10) NOT NULL DEFAULT 'core',
-                                                    -- 'core'(매뉴얼+절차서+양식) | 'guideline'(지침서) — 2026-08-24 추가.
-                                                    -- 같은 프로젝트(application)라도 절차서 계열 통합본과 지침서 통합본은
-                                                    -- composed_doc_ids가 섞이지 않도록 별도 행으로 분리한다.
-    storage_path              varchar(500),
-    composed_doc_ids            jsonb NOT NULL,     -- [doc_id, doc_id, ...]
-    created_at                    timestamptz NOT NULL DEFAULT now(),
-    CHECK (
-        (conversion_project_id IS NULL AND format = 'hwp')
-        OR (conversion_project_id IS NOT NULL AND format IN ('xlsx', 'docx'))
-    ),
-    CHECK (bundle_scope IN ('core', 'guideline'))
+
+--
+-- Name: form_template; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.form_template (
+    form_id bigint NOT NULL,
+    application_id bigint NOT NULL,
+    step_id bigint,
+    form_name character varying(200) NOT NULL
 );
 
-CREATE TABLE document_revision_log (
-    log_id          bigserial PRIMARY KEY,
-    doc_id          bigint REFERENCES document_individual(doc_id),
-    integrated_id   bigint REFERENCES document_integrated(integrated_id),
-    revision_no     int NOT NULL,
-    change_note     text,
-    changed_at      timestamptz NOT NULL DEFAULT now()
+
+--
+-- Name: form_template_form_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.form_template_form_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: form_template_form_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.form_template_form_id_seq OWNED BY public.form_template.form_id;
+
+
+--
+-- Name: guideline_item; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.guideline_item (
+    item_id bigint NOT NULL,
+    application_id bigint NOT NULL,
+    doc_type_id bigint NOT NULL,
+    item_title character varying(200) NOT NULL,
+    tech_standard text,
+    work_method text,
+    source_regulation character varying(200),
+    content_source_type character varying(20) DEFAULT 'sample'::character varying NOT NULL,
+    needs_review boolean DEFAULT false NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
--- ---------- 영역 5-보조. HWP 렌더링 작업 큐 (3순위 재검토, 2026-08-18 추가) ----------
--- 한글SDK가 서버자동화 라이선스인 것은 확인됨. 다만 현재는 Windows 서버에서만
--- 구동되고(리눅스 옵션은 추후 구매 시 재확인 필요), Postgres/Streamlit 등
--- 나머지 스택은 리눅스(Cloud Run 등)로 유지될 전망이라, HWP 출력 단계만 별도
--- Windows 서버로 원격 위임되는 비동기 구조가 됨. 이 위임 요청/결과를 추적하기
--- 위한 큐 테이블이다. 리눅스 옵션이 확정되어 별도 서버가 필요 없어지면 이
--- 테이블은 단순화하거나 제거해도 된다(문서 생성 로직 자체는 이 테이블에
--- 의존하지 않도록 설계함 — document_individual/document_integrated가 이미
--- 최종 결과의 storage_path를 갖고, hwp_render_job은 그 결과가 나오기까지의
--- 중간 상태만 추적).
-CREATE TABLE hwp_render_job (
-    job_id          bigserial PRIMARY KEY,
-    doc_id          bigint REFERENCES document_individual(doc_id),
-    integrated_id   bigint REFERENCES document_integrated(integrated_id),
-    render_server   varchar(20) NOT NULL DEFAULT 'windows',  -- 'windows' | 'linux'(리눅스 옵션 확정 시)
-    status          varchar(20) NOT NULL DEFAULT 'queued',   -- queued|processing|done|failed
+
+--
+-- Name: guideline_item_item_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.guideline_item_item_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: guideline_item_item_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.guideline_item_item_id_seq OWNED BY public.guideline_item.item_id;
+
+
+--
+-- Name: hwp_render_job; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.hwp_render_job (
+    job_id bigint NOT NULL,
+    doc_id bigint,
+    integrated_id bigint,
+    render_server character varying(20) DEFAULT 'windows'::character varying NOT NULL,
+    status character varying(20) DEFAULT 'queued'::character varying NOT NULL,
     request_payload jsonb,
-    output_path     varchar(500),
-    error_msg       text,
-    requested_at    timestamptz NOT NULL DEFAULT now(),
-    completed_at    timestamptz,
-    CHECK (doc_id IS NOT NULL OR integrated_id IS NOT NULL)
-);
-CREATE INDEX idx_hwp_render_job_status ON hwp_render_job(status);
-
--- ---------- 기존 통합본 샘플 분해 추적 (4순위 작업용) ----------
-
-CREATE TABLE legacy_source_document (
-    legacy_id       bigserial PRIMARY KEY,
-    file_name       varchar(300) NOT NULL,
-    uploaded_at     timestamptz NOT NULL DEFAULT now(),
-    note            text
+    output_path character varying(500),
+    error_msg text,
+    requested_at timestamp with time zone DEFAULT now() NOT NULL,
+    completed_at timestamp with time zone,
+    CONSTRAINT hwp_render_job_check CHECK (((doc_id IS NOT NULL) OR (integrated_id IS NOT NULL)))
 );
 
-CREATE TABLE legacy_split_mapping (
-    mapping_id  bigserial PRIMARY KEY,
-    legacy_id   bigint NOT NULL REFERENCES legacy_source_document(legacy_id),
-    doc_id      bigint NOT NULL REFERENCES document_individual(doc_id)
+
+--
+-- Name: hwp_render_job_job_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.hwp_render_job_job_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: hwp_render_job_job_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.hwp_render_job_job_id_seq OWNED BY public.hwp_render_job.job_id;
+
+
+--
+-- Name: iaf_group; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.iaf_group (
+    iaf_num character varying(2) NOT NULL,
+    name character varying(100) NOT NULL
 );
 
--- ============================================================
--- 기준정보 초기값 (standard 3개 규격) — 나머지 기준정보(sector_main,
--- iaf_group, sector_profile, doc_type)는 4순위에서 CSV Import로 적재
--- ============================================================
 
-INSERT INTO standard (std_code, iso_num, title, prefix) VALUES
-    ('q',  'ISO 9001',  '품질경영시스템',     'Q'),
-    ('e',  'ISO 14001', '환경경영시스템',     'E'),
-    ('hs', 'ISO 45001', '안전보건경영시스템', 'HS');
+--
+-- Name: legacy_source_document; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.legacy_source_document (
+    legacy_id bigint NOT NULL,
+    file_name character varying(300) NOT NULL,
+    uploaded_at timestamp with time zone DEFAULT now() NOT NULL,
+    note text,
+    application_id bigint
+);
+
+
+--
+-- Name: legacy_source_document_legacy_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.legacy_source_document_legacy_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: legacy_source_document_legacy_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.legacy_source_document_legacy_id_seq OWNED BY public.legacy_source_document.legacy_id;
+
+
+--
+-- Name: legacy_split_mapping; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.legacy_split_mapping (
+    mapping_id bigint NOT NULL,
+    legacy_id bigint NOT NULL,
+    doc_id bigint NOT NULL
+);
+
+
+--
+-- Name: legacy_split_mapping_mapping_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.legacy_split_mapping_mapping_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: legacy_split_mapping_mapping_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.legacy_split_mapping_mapping_id_seq OWNED BY public.legacy_split_mapping.mapping_id;
+
+
+--
+-- Name: org_chart; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.org_chart (
+    org_chart_id bigint NOT NULL,
+    org_chart_name character varying(200) NOT NULL,
+    industry_tag character varying(50),
+    company_size_tag character varying(20),
+    source_company_id bigint,
+    is_template boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    application_id bigint
+);
+
+
+--
+-- Name: org_chart_org_chart_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.org_chart_org_chart_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: org_chart_org_chart_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.org_chart_org_chart_id_seq OWNED BY public.org_chart.org_chart_id;
+
+
+--
+-- Name: org_chart_role; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.org_chart_role (
+    role_id bigint NOT NULL,
+    org_chart_id bigint NOT NULL,
+    role_name character varying(100) NOT NULL,
+    department character varying(100),
+    parent_role_id bigint,
+    seq integer DEFAULT 0 NOT NULL,
+    dept_code character varying(20),
+    mission text
+);
+
+
+--
+-- Name: org_chart_role_role_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.org_chart_role_role_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: org_chart_role_role_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.org_chart_role_role_id_seq OWNED BY public.org_chart_role.role_id;
+
+
+--
+-- Name: org_rr_approval_log; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.org_rr_approval_log (
+    log_id bigint NOT NULL,
+    application_id bigint NOT NULL,
+    rev_no integer NOT NULL,
+    snapshot jsonb NOT NULL,
+    approved_by character varying(100),
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: org_rr_approval_log_log_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.org_rr_approval_log_log_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: org_rr_approval_log_log_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.org_rr_approval_log_log_id_seq OWNED BY public.org_rr_approval_log.log_id;
+
+
+--
+-- Name: process_dependency; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.process_dependency (
+    dependency_id bigint NOT NULL,
+    from_step_id bigint NOT NULL,
+    to_step_id bigint NOT NULL
+);
+
+
+--
+-- Name: process_dependency_dependency_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.process_dependency_dependency_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: process_dependency_dependency_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.process_dependency_dependency_id_seq OWNED BY public.process_dependency.dependency_id;
+
+
+--
+-- Name: process_step; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.process_step (
+    step_id bigint NOT NULL,
+    application_id bigint NOT NULL,
+    doc_type_id bigint NOT NULL,
+    pdca_stage character varying(1) NOT NULL,
+    stage_seq integer NOT NULL,
+    step_name character varying(200) NOT NULL,
+    clause_no character varying(10),
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: process_step_activity; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.process_step_activity (
+    activity_id bigint NOT NULL,
+    step_id bigint NOT NULL,
+    activity_desc text NOT NULL,
+    seq integer DEFAULT 0 NOT NULL
+);
+
+
+--
+-- Name: process_step_activity_activity_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.process_step_activity_activity_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: process_step_activity_activity_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.process_step_activity_activity_id_seq OWNED BY public.process_step_activity.activity_id;
+
+
+--
+-- Name: process_step_io; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.process_step_io (
+    io_id bigint NOT NULL,
+    step_id bigint NOT NULL,
+    io_type character varying(10) NOT NULL,
+    io_desc character varying(300) NOT NULL
+);
+
+
+--
+-- Name: process_step_io_io_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.process_step_io_io_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: process_step_io_io_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.process_step_io_io_id_seq OWNED BY public.process_step_io.io_id;
+
+
+--
+-- Name: process_step_step_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.process_step_step_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: process_step_step_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.process_step_step_id_seq OWNED BY public.process_step.step_id;
+
+
+--
+-- Name: process_term_usage; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.process_term_usage (
+    usage_id bigint NOT NULL,
+    step_id bigint NOT NULL,
+    term_id bigint NOT NULL
+);
+
+
+--
+-- Name: process_term_usage_usage_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.process_term_usage_usage_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: process_term_usage_usage_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.process_term_usage_usage_id_seq OWNED BY public.process_term_usage.usage_id;
+
+
+--
+-- Name: responsibility_matrix; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.responsibility_matrix (
+    resp_id bigint NOT NULL,
+    step_id bigint NOT NULL,
+    role_id bigint NOT NULL,
+    resp_type character varying(10) NOT NULL
+);
+
+
+--
+-- Name: responsibility_matrix_resp_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.responsibility_matrix_resp_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: responsibility_matrix_resp_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.responsibility_matrix_resp_id_seq OWNED BY public.responsibility_matrix.resp_id;
+
+
+--
+-- Name: sample_doc_classification; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.sample_doc_classification (
+    classification_id bigint NOT NULL,
+    analysis_id bigint,
+    doc_title character varying(200) NOT NULL,
+    doc_excerpt text,
+    llm_category character varying(20),
+    llm_reasoning text,
+    reviewed boolean DEFAULT false NOT NULL,
+    resulting_doc_type_id bigint,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: sample_doc_classification_classification_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.sample_doc_classification_classification_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: sample_doc_classification_classification_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.sample_doc_classification_classification_id_seq OWNED BY public.sample_doc_classification.classification_id;
+
+
+--
+-- Name: sample_original; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.sample_original (
+    original_no smallint NOT NULL,
+    original_name character varying(300) NOT NULL
+);
+
+
+--
+-- Name: sample_original_original_no_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.sample_original_original_no_seq
+    AS smallint
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: sample_original_original_no_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.sample_original_original_no_seq OWNED BY public.sample_original.original_no;
+
+
+--
+-- Name: sample_project_analysis; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.sample_project_analysis (
+    analysis_id bigint NOT NULL,
+    source_file_name character varying(255) NOT NULL,
+    excerpt_text text,
+    candidate_profile_ids jsonb,
+    matched_keywords jsonb,
+    llm_sector_code character varying(10),
+    llm_profile_seq smallint,
+    llm_reasoning text,
+    reviewed boolean DEFAULT false NOT NULL,
+    resulting_profile_id bigint,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: sample_project_analysis_analysis_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.sample_project_analysis_analysis_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: sample_project_analysis_analysis_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.sample_project_analysis_analysis_id_seq OWNED BY public.sample_project_analysis.analysis_id;
+
+
+--
+-- Name: sector_main; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.sector_main (
+    code character(1) NOT NULL,
+    name character varying(50) NOT NULL
+);
+
+
+--
+-- Name: sector_profile; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.sector_profile (
+    profile_id bigint NOT NULL,
+    sector_code character varying(10) NOT NULL,
+    profile_seq smallint NOT NULL,
+    sector_main character(1) NOT NULL,
+    iaf_num character varying(2) NOT NULL,
+    sector_detail character(1) NOT NULL,
+    sector_name character varying(200) NOT NULL,
+    is_default boolean DEFAULT false NOT NULL,
+    hazards jsonb DEFAULT '[]'::jsonb NOT NULL,
+    env_aspects jsonb DEFAULT '[]'::jsonb NOT NULL,
+    quality_chars jsonb DEFAULT '[]'::jsonb NOT NULL,
+    key_laws_sh jsonb DEFAULT '[]'::jsonb NOT NULL,
+    key_laws_env jsonb DEFAULT '[]'::jsonb NOT NULL,
+    process_hints jsonb DEFAULT '[]'::jsonb NOT NULL,
+    source_type character varying(20) DEFAULT 'iaf_csv'::character varying NOT NULL,
+    created_by_company_id bigint,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT sector_profile_profile_seq_check CHECK (((profile_seq >= 1) AND (profile_seq <= 99)))
+);
+
+
+--
+-- Name: sector_profile_profile_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.sector_profile_profile_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: sector_profile_profile_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.sector_profile_profile_id_seq OWNED BY public.sector_profile.profile_id;
+
+
+--
+-- Name: standard; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.standard (
+    std_code character varying(4) NOT NULL,
+    iso_num character varying(20) NOT NULL,
+    title character varying(50) NOT NULL,
+    prefix character varying(4) NOT NULL
+);
+
+
+--
+-- Name: term_dictionary; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.term_dictionary (
+    term_id bigint NOT NULL,
+    std_code character varying(4) NOT NULL,
+    term character varying(100) NOT NULL,
+    definition text NOT NULL,
+    source_clause character varying(20)
+);
+
+
+--
+-- Name: term_dictionary_term_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.term_dictionary_term_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: term_dictionary_term_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.term_dictionary_term_id_seq OWNED BY public.term_dictionary.term_id;
+
+
+--
+-- Name: application application_id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.application ALTER COLUMN application_id SET DEFAULT nextval('public.application_application_id_seq'::regclass);
+
+
+--
+-- Name: company company_id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.company ALTER COLUMN company_id SET DEFAULT nextval('public.company_company_id_seq'::regclass);
+
+
+--
+-- Name: conversion_project conversion_id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.conversion_project ALTER COLUMN conversion_id SET DEFAULT nextval('public.conversion_project_conversion_id_seq'::regclass);
+
+
+--
+-- Name: dept_responsibility resp_id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.dept_responsibility ALTER COLUMN resp_id SET DEFAULT nextval('public.dept_responsibility_resp_id_seq'::regclass);
+
+
+--
+-- Name: doc_type doc_type_id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.doc_type ALTER COLUMN doc_type_id SET DEFAULT nextval('public.doc_type_doc_type_id_seq'::regclass);
+
+
+--
+-- Name: document_content content_id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.document_content ALTER COLUMN content_id SET DEFAULT nextval('public.document_content_content_id_seq'::regclass);
+
+
+--
+-- Name: document_individual doc_id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.document_individual ALTER COLUMN doc_id SET DEFAULT nextval('public.document_individual_doc_id_seq'::regclass);
+
+
+--
+-- Name: document_integrated integrated_id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.document_integrated ALTER COLUMN integrated_id SET DEFAULT nextval('public.document_integrated_integrated_id_seq'::regclass);
+
+
+--
+-- Name: document_revision_log log_id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.document_revision_log ALTER COLUMN log_id SET DEFAULT nextval('public.document_revision_log_log_id_seq'::regclass);
+
+
+--
+-- Name: form_field field_id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.form_field ALTER COLUMN field_id SET DEFAULT nextval('public.form_field_field_id_seq'::regclass);
+
+
+--
+-- Name: form_template form_id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.form_template ALTER COLUMN form_id SET DEFAULT nextval('public.form_template_form_id_seq'::regclass);
+
+
+--
+-- Name: guideline_item item_id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.guideline_item ALTER COLUMN item_id SET DEFAULT nextval('public.guideline_item_item_id_seq'::regclass);
+
+
+--
+-- Name: hwp_render_job job_id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.hwp_render_job ALTER COLUMN job_id SET DEFAULT nextval('public.hwp_render_job_job_id_seq'::regclass);
+
+
+--
+-- Name: legacy_source_document legacy_id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.legacy_source_document ALTER COLUMN legacy_id SET DEFAULT nextval('public.legacy_source_document_legacy_id_seq'::regclass);
+
+
+--
+-- Name: legacy_split_mapping mapping_id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.legacy_split_mapping ALTER COLUMN mapping_id SET DEFAULT nextval('public.legacy_split_mapping_mapping_id_seq'::regclass);
+
+
+--
+-- Name: org_chart org_chart_id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.org_chart ALTER COLUMN org_chart_id SET DEFAULT nextval('public.org_chart_org_chart_id_seq'::regclass);
+
+
+--
+-- Name: org_chart_role role_id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.org_chart_role ALTER COLUMN role_id SET DEFAULT nextval('public.org_chart_role_role_id_seq'::regclass);
+
+
+--
+-- Name: org_rr_approval_log log_id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.org_rr_approval_log ALTER COLUMN log_id SET DEFAULT nextval('public.org_rr_approval_log_log_id_seq'::regclass);
+
+
+--
+-- Name: process_dependency dependency_id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.process_dependency ALTER COLUMN dependency_id SET DEFAULT nextval('public.process_dependency_dependency_id_seq'::regclass);
+
+
+--
+-- Name: process_step step_id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.process_step ALTER COLUMN step_id SET DEFAULT nextval('public.process_step_step_id_seq'::regclass);
+
+
+--
+-- Name: process_step_activity activity_id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.process_step_activity ALTER COLUMN activity_id SET DEFAULT nextval('public.process_step_activity_activity_id_seq'::regclass);
+
+
+--
+-- Name: process_step_io io_id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.process_step_io ALTER COLUMN io_id SET DEFAULT nextval('public.process_step_io_io_id_seq'::regclass);
+
+
+--
+-- Name: process_term_usage usage_id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.process_term_usage ALTER COLUMN usage_id SET DEFAULT nextval('public.process_term_usage_usage_id_seq'::regclass);
+
+
+--
+-- Name: responsibility_matrix resp_id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.responsibility_matrix ALTER COLUMN resp_id SET DEFAULT nextval('public.responsibility_matrix_resp_id_seq'::regclass);
+
+
+--
+-- Name: sample_doc_classification classification_id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sample_doc_classification ALTER COLUMN classification_id SET DEFAULT nextval('public.sample_doc_classification_classification_id_seq'::regclass);
+
+
+--
+-- Name: sample_original original_no; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sample_original ALTER COLUMN original_no SET DEFAULT nextval('public.sample_original_original_no_seq'::regclass);
+
+
+--
+-- Name: sample_project_analysis analysis_id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sample_project_analysis ALTER COLUMN analysis_id SET DEFAULT nextval('public.sample_project_analysis_analysis_id_seq'::regclass);
+
+
+--
+-- Name: sector_profile profile_id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sector_profile ALTER COLUMN profile_id SET DEFAULT nextval('public.sector_profile_profile_id_seq'::regclass);
+
+
+--
+-- Name: term_dictionary term_id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.term_dictionary ALTER COLUMN term_id SET DEFAULT nextval('public.term_dictionary_term_id_seq'::regclass);
+
+
+--
+-- Name: application application_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.application
+    ADD CONSTRAINT application_pkey PRIMARY KEY (application_id);
+
+
+--
+-- Name: application application_project_no_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.application
+    ADD CONSTRAINT application_project_no_key UNIQUE (project_no);
+
+
+--
+-- Name: company company_biz_reg_no_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.company
+    ADD CONSTRAINT company_biz_reg_no_key UNIQUE (biz_reg_no);
+
+
+--
+-- Name: company company_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.company
+    ADD CONSTRAINT company_pkey PRIMARY KEY (company_id);
+
+
+--
+-- Name: conversion_project conversion_project_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.conversion_project
+    ADD CONSTRAINT conversion_project_pkey PRIMARY KEY (conversion_id);
+
+
+--
+-- Name: conversion_project conversion_project_project_no_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.conversion_project
+    ADD CONSTRAINT conversion_project_project_no_key UNIQUE (project_no);
+
+
+--
+-- Name: dept_master dept_master_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.dept_master
+    ADD CONSTRAINT dept_master_pkey PRIMARY KEY (dept_code);
+
+
+--
+-- Name: dept_responsibility dept_responsibility_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.dept_responsibility
+    ADD CONSTRAINT dept_responsibility_pkey PRIMARY KEY (resp_id);
+
+
+--
+-- Name: doc_type doc_type_doc_type_code_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.doc_type
+    ADD CONSTRAINT doc_type_doc_type_code_key UNIQUE (doc_type_code);
+
+
+--
+-- Name: doc_type doc_type_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.doc_type
+    ADD CONSTRAINT doc_type_pkey PRIMARY KEY (doc_type_id);
+
+
+--
+-- Name: document_content document_content_doc_id_uniq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.document_content
+    ADD CONSTRAINT document_content_doc_id_uniq UNIQUE (doc_id);
+
+
+--
+-- Name: document_content document_content_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.document_content
+    ADD CONSTRAINT document_content_pkey PRIMARY KEY (content_id);
+
+
+--
+-- Name: document_individual document_individual_app_doctype_uniq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.document_individual
+    ADD CONSTRAINT document_individual_app_doctype_uniq UNIQUE (application_id, doc_type_id);
+
+
+--
+-- Name: document_individual document_individual_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.document_individual
+    ADD CONSTRAINT document_individual_pkey PRIMARY KEY (doc_id);
+
+
+--
+-- Name: document_integrated document_integrated_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.document_integrated
+    ADD CONSTRAINT document_integrated_pkey PRIMARY KEY (integrated_id);
+
+
+--
+-- Name: document_revision_log document_revision_log_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.document_revision_log
+    ADD CONSTRAINT document_revision_log_pkey PRIMARY KEY (log_id);
+
+
+--
+-- Name: form_field form_field_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.form_field
+    ADD CONSTRAINT form_field_pkey PRIMARY KEY (field_id);
+
+
+--
+-- Name: form_pattern form_pattern_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.form_pattern
+    ADD CONSTRAINT form_pattern_pkey PRIMARY KEY (pattern_code);
+
+
+--
+-- Name: form_template form_template_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.form_template
+    ADD CONSTRAINT form_template_pkey PRIMARY KEY (form_id);
+
+
+--
+-- Name: guideline_item guideline_item_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.guideline_item
+    ADD CONSTRAINT guideline_item_pkey PRIMARY KEY (item_id);
+
+
+--
+-- Name: hwp_render_job hwp_render_job_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.hwp_render_job
+    ADD CONSTRAINT hwp_render_job_pkey PRIMARY KEY (job_id);
+
+
+--
+-- Name: iaf_group iaf_group_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.iaf_group
+    ADD CONSTRAINT iaf_group_pkey PRIMARY KEY (iaf_num);
+
+
+--
+-- Name: legacy_source_document legacy_source_document_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.legacy_source_document
+    ADD CONSTRAINT legacy_source_document_pkey PRIMARY KEY (legacy_id);
+
+
+--
+-- Name: legacy_split_mapping legacy_split_mapping_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.legacy_split_mapping
+    ADD CONSTRAINT legacy_split_mapping_pkey PRIMARY KEY (mapping_id);
+
+
+--
+-- Name: org_chart org_chart_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.org_chart
+    ADD CONSTRAINT org_chart_pkey PRIMARY KEY (org_chart_id);
+
+
+--
+-- Name: org_chart_role org_chart_role_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.org_chart_role
+    ADD CONSTRAINT org_chart_role_pkey PRIMARY KEY (role_id);
+
+
+--
+-- Name: org_rr_approval_log org_rr_approval_log_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.org_rr_approval_log
+    ADD CONSTRAINT org_rr_approval_log_pkey PRIMARY KEY (log_id);
+
+
+--
+-- Name: process_dependency process_dependency_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.process_dependency
+    ADD CONSTRAINT process_dependency_pkey PRIMARY KEY (dependency_id);
+
+
+--
+-- Name: process_step_activity process_step_activity_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.process_step_activity
+    ADD CONSTRAINT process_step_activity_pkey PRIMARY KEY (activity_id);
+
+
+--
+-- Name: process_step_io process_step_io_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.process_step_io
+    ADD CONSTRAINT process_step_io_pkey PRIMARY KEY (io_id);
+
+
+--
+-- Name: process_step process_step_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.process_step
+    ADD CONSTRAINT process_step_pkey PRIMARY KEY (step_id);
+
+
+--
+-- Name: process_term_usage process_term_usage_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.process_term_usage
+    ADD CONSTRAINT process_term_usage_pkey PRIMARY KEY (usage_id);
+
+
+--
+-- Name: responsibility_matrix responsibility_matrix_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.responsibility_matrix
+    ADD CONSTRAINT responsibility_matrix_pkey PRIMARY KEY (resp_id);
+
+
+--
+-- Name: sample_doc_classification sample_doc_classification_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sample_doc_classification
+    ADD CONSTRAINT sample_doc_classification_pkey PRIMARY KEY (classification_id);
+
+
+--
+-- Name: sample_original sample_original_original_name_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sample_original
+    ADD CONSTRAINT sample_original_original_name_key UNIQUE (original_name);
+
+
+--
+-- Name: sample_original sample_original_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sample_original
+    ADD CONSTRAINT sample_original_pkey PRIMARY KEY (original_no);
+
+
+--
+-- Name: sample_project_analysis sample_project_analysis_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sample_project_analysis
+    ADD CONSTRAINT sample_project_analysis_pkey PRIMARY KEY (analysis_id);
+
+
+--
+-- Name: sector_main sector_main_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sector_main
+    ADD CONSTRAINT sector_main_pkey PRIMARY KEY (code);
+
+
+--
+-- Name: sector_profile sector_profile_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sector_profile
+    ADD CONSTRAINT sector_profile_pkey PRIMARY KEY (profile_id);
+
+
+--
+-- Name: sector_profile sector_profile_sector_code_profile_seq_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sector_profile
+    ADD CONSTRAINT sector_profile_sector_code_profile_seq_key UNIQUE (sector_code, profile_seq);
+
+
+--
+-- Name: standard standard_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.standard
+    ADD CONSTRAINT standard_pkey PRIMARY KEY (std_code);
+
+
+--
+-- Name: term_dictionary term_dictionary_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.term_dictionary
+    ADD CONSTRAINT term_dictionary_pkey PRIMARY KEY (term_id);
+
+
+--
+-- Name: idx_conversion_project_app; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_conversion_project_app ON public.conversion_project USING btree (application_id);
+
+
+--
+-- Name: idx_hwp_render_job_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_hwp_render_job_status ON public.hwp_render_job USING btree (status);
+
+
+--
+-- Name: idx_sector_profile_code; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_sector_profile_code ON public.sector_profile USING btree (sector_code);
+
+
+--
+-- Name: application application_company_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.application
+    ADD CONSTRAINT application_company_id_fkey FOREIGN KEY (company_id) REFERENCES public.company(company_id);
+
+
+--
+-- Name: application application_org_chart_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.application
+    ADD CONSTRAINT application_org_chart_id_fkey FOREIGN KEY (org_chart_id) REFERENCES public.org_chart(org_chart_id);
+
+
+--
+-- Name: application application_original_no_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.application
+    ADD CONSTRAINT application_original_no_fkey FOREIGN KEY (original_no) REFERENCES public.sample_original(original_no);
+
+
+--
+-- Name: application application_profile_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.application
+    ADD CONSTRAINT application_profile_id_fkey FOREIGN KEY (profile_id) REFERENCES public.sector_profile(profile_id);
+
+
+--
+-- Name: conversion_project conversion_project_application_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.conversion_project
+    ADD CONSTRAINT conversion_project_application_id_fkey FOREIGN KEY (application_id) REFERENCES public.application(application_id);
+
+
+--
+-- Name: dept_responsibility dept_responsibility_related_step_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.dept_responsibility
+    ADD CONSTRAINT dept_responsibility_related_step_id_fkey FOREIGN KEY (related_step_id) REFERENCES public.process_step(step_id);
+
+
+--
+-- Name: dept_responsibility dept_responsibility_role_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.dept_responsibility
+    ADD CONSTRAINT dept_responsibility_role_id_fkey FOREIGN KEY (role_id) REFERENCES public.org_chart_role(role_id);
+
+
+--
+-- Name: doc_type doc_type_form_pattern_code_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.doc_type
+    ADD CONSTRAINT doc_type_form_pattern_code_fkey FOREIGN KEY (form_pattern_code) REFERENCES public.form_pattern(pattern_code);
+
+
+--
+-- Name: document_content document_content_doc_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.document_content
+    ADD CONSTRAINT document_content_doc_id_fkey FOREIGN KEY (doc_id) REFERENCES public.document_individual(doc_id);
+
+
+--
+-- Name: document_individual document_individual_application_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.document_individual
+    ADD CONSTRAINT document_individual_application_id_fkey FOREIGN KEY (application_id) REFERENCES public.application(application_id);
+
+
+--
+-- Name: document_individual document_individual_conversion_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.document_individual
+    ADD CONSTRAINT document_individual_conversion_project_id_fkey FOREIGN KEY (conversion_project_id) REFERENCES public.conversion_project(conversion_id);
+
+
+--
+-- Name: document_individual document_individual_doc_type_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.document_individual
+    ADD CONSTRAINT document_individual_doc_type_id_fkey FOREIGN KEY (doc_type_id) REFERENCES public.doc_type(doc_type_id);
+
+
+--
+-- Name: document_integrated document_integrated_application_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.document_integrated
+    ADD CONSTRAINT document_integrated_application_id_fkey FOREIGN KEY (application_id) REFERENCES public.application(application_id);
+
+
+--
+-- Name: document_integrated document_integrated_conversion_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.document_integrated
+    ADD CONSTRAINT document_integrated_conversion_project_id_fkey FOREIGN KEY (conversion_project_id) REFERENCES public.conversion_project(conversion_id);
+
+
+--
+-- Name: document_revision_log document_revision_log_doc_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.document_revision_log
+    ADD CONSTRAINT document_revision_log_doc_id_fkey FOREIGN KEY (doc_id) REFERENCES public.document_individual(doc_id);
+
+
+--
+-- Name: document_revision_log document_revision_log_integrated_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.document_revision_log
+    ADD CONSTRAINT document_revision_log_integrated_id_fkey FOREIGN KEY (integrated_id) REFERENCES public.document_integrated(integrated_id);
+
+
+--
+-- Name: form_field form_field_form_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.form_field
+    ADD CONSTRAINT form_field_form_id_fkey FOREIGN KEY (form_id) REFERENCES public.form_template(form_id);
+
+
+--
+-- Name: form_template form_template_application_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.form_template
+    ADD CONSTRAINT form_template_application_id_fkey FOREIGN KEY (application_id) REFERENCES public.application(application_id);
+
+
+--
+-- Name: form_template form_template_step_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.form_template
+    ADD CONSTRAINT form_template_step_id_fkey FOREIGN KEY (step_id) REFERENCES public.process_step(step_id);
+
+
+--
+-- Name: guideline_item guideline_item_application_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.guideline_item
+    ADD CONSTRAINT guideline_item_application_id_fkey FOREIGN KEY (application_id) REFERENCES public.application(application_id);
+
+
+--
+-- Name: guideline_item guideline_item_doc_type_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.guideline_item
+    ADD CONSTRAINT guideline_item_doc_type_id_fkey FOREIGN KEY (doc_type_id) REFERENCES public.doc_type(doc_type_id);
+
+
+--
+-- Name: hwp_render_job hwp_render_job_doc_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.hwp_render_job
+    ADD CONSTRAINT hwp_render_job_doc_id_fkey FOREIGN KEY (doc_id) REFERENCES public.document_individual(doc_id);
+
+
+--
+-- Name: hwp_render_job hwp_render_job_integrated_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.hwp_render_job
+    ADD CONSTRAINT hwp_render_job_integrated_id_fkey FOREIGN KEY (integrated_id) REFERENCES public.document_integrated(integrated_id);
+
+
+--
+-- Name: legacy_source_document legacy_source_document_application_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.legacy_source_document
+    ADD CONSTRAINT legacy_source_document_application_id_fkey FOREIGN KEY (application_id) REFERENCES public.application(application_id);
+
+
+--
+-- Name: legacy_split_mapping legacy_split_mapping_doc_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.legacy_split_mapping
+    ADD CONSTRAINT legacy_split_mapping_doc_id_fkey FOREIGN KEY (doc_id) REFERENCES public.document_individual(doc_id);
+
+
+--
+-- Name: legacy_split_mapping legacy_split_mapping_legacy_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.legacy_split_mapping
+    ADD CONSTRAINT legacy_split_mapping_legacy_id_fkey FOREIGN KEY (legacy_id) REFERENCES public.legacy_source_document(legacy_id);
+
+
+--
+-- Name: org_chart org_chart_application_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.org_chart
+    ADD CONSTRAINT org_chart_application_id_fkey FOREIGN KEY (application_id) REFERENCES public.application(application_id);
+
+
+--
+-- Name: org_chart_role org_chart_role_dept_code_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.org_chart_role
+    ADD CONSTRAINT org_chart_role_dept_code_fkey FOREIGN KEY (dept_code) REFERENCES public.dept_master(dept_code);
+
+
+--
+-- Name: org_chart_role org_chart_role_org_chart_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.org_chart_role
+    ADD CONSTRAINT org_chart_role_org_chart_id_fkey FOREIGN KEY (org_chart_id) REFERENCES public.org_chart(org_chart_id);
+
+
+--
+-- Name: org_chart_role org_chart_role_parent_role_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.org_chart_role
+    ADD CONSTRAINT org_chart_role_parent_role_id_fkey FOREIGN KEY (parent_role_id) REFERENCES public.org_chart_role(role_id);
+
+
+--
+-- Name: org_chart org_chart_source_company_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.org_chart
+    ADD CONSTRAINT org_chart_source_company_id_fkey FOREIGN KEY (source_company_id) REFERENCES public.company(company_id);
+
+
+--
+-- Name: org_rr_approval_log org_rr_approval_log_application_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.org_rr_approval_log
+    ADD CONSTRAINT org_rr_approval_log_application_id_fkey FOREIGN KEY (application_id) REFERENCES public.application(application_id);
+
+
+--
+-- Name: process_dependency process_dependency_from_step_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.process_dependency
+    ADD CONSTRAINT process_dependency_from_step_id_fkey FOREIGN KEY (from_step_id) REFERENCES public.process_step(step_id);
+
+
+--
+-- Name: process_dependency process_dependency_to_step_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.process_dependency
+    ADD CONSTRAINT process_dependency_to_step_id_fkey FOREIGN KEY (to_step_id) REFERENCES public.process_step(step_id);
+
+
+--
+-- Name: process_step_activity process_step_activity_step_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.process_step_activity
+    ADD CONSTRAINT process_step_activity_step_id_fkey FOREIGN KEY (step_id) REFERENCES public.process_step(step_id);
+
+
+--
+-- Name: process_step process_step_application_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.process_step
+    ADD CONSTRAINT process_step_application_id_fkey FOREIGN KEY (application_id) REFERENCES public.application(application_id);
+
+
+--
+-- Name: process_step process_step_doc_type_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.process_step
+    ADD CONSTRAINT process_step_doc_type_id_fkey FOREIGN KEY (doc_type_id) REFERENCES public.doc_type(doc_type_id);
+
+
+--
+-- Name: process_step_io process_step_io_step_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.process_step_io
+    ADD CONSTRAINT process_step_io_step_id_fkey FOREIGN KEY (step_id) REFERENCES public.process_step(step_id);
+
+
+--
+-- Name: process_term_usage process_term_usage_step_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.process_term_usage
+    ADD CONSTRAINT process_term_usage_step_id_fkey FOREIGN KEY (step_id) REFERENCES public.process_step(step_id);
+
+
+--
+-- Name: process_term_usage process_term_usage_term_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.process_term_usage
+    ADD CONSTRAINT process_term_usage_term_id_fkey FOREIGN KEY (term_id) REFERENCES public.term_dictionary(term_id);
+
+
+--
+-- Name: responsibility_matrix responsibility_matrix_role_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.responsibility_matrix
+    ADD CONSTRAINT responsibility_matrix_role_id_fkey FOREIGN KEY (role_id) REFERENCES public.org_chart_role(role_id);
+
+
+--
+-- Name: responsibility_matrix responsibility_matrix_step_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.responsibility_matrix
+    ADD CONSTRAINT responsibility_matrix_step_id_fkey FOREIGN KEY (step_id) REFERENCES public.process_step(step_id);
+
+
+--
+-- Name: sample_doc_classification sample_doc_classification_analysis_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sample_doc_classification
+    ADD CONSTRAINT sample_doc_classification_analysis_id_fkey FOREIGN KEY (analysis_id) REFERENCES public.sample_project_analysis(analysis_id);
+
+
+--
+-- Name: sample_doc_classification sample_doc_classification_resulting_doc_type_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sample_doc_classification
+    ADD CONSTRAINT sample_doc_classification_resulting_doc_type_id_fkey FOREIGN KEY (resulting_doc_type_id) REFERENCES public.doc_type(doc_type_id);
+
+
+--
+-- Name: sample_project_analysis sample_project_analysis_resulting_profile_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sample_project_analysis
+    ADD CONSTRAINT sample_project_analysis_resulting_profile_id_fkey FOREIGN KEY (resulting_profile_id) REFERENCES public.sector_profile(profile_id);
+
+
+--
+-- Name: sector_profile sector_profile_created_by_company_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sector_profile
+    ADD CONSTRAINT sector_profile_created_by_company_id_fkey FOREIGN KEY (created_by_company_id) REFERENCES public.company(company_id);
+
+
+--
+-- Name: sector_profile sector_profile_iaf_num_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sector_profile
+    ADD CONSTRAINT sector_profile_iaf_num_fkey FOREIGN KEY (iaf_num) REFERENCES public.iaf_group(iaf_num);
+
+
+--
+-- Name: sector_profile sector_profile_sector_main_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sector_profile
+    ADD CONSTRAINT sector_profile_sector_main_fkey FOREIGN KEY (sector_main) REFERENCES public.sector_main(code);
+
+
+--
+-- PostgreSQL database dump complete
+--
+
+
