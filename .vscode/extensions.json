@@ -1,0 +1,13 @@
+{
+    "recommendations": [
+        "anthropic.claude-code",
+        "eamodio.gitlens",
+        "mhutchie.git-graph",
+        "github.vscode-pull-request-github",
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "cweijan.vscode-mysql-client2",
+        "mechatroner.rainbow-csv",
+        "arieldev.sql-visual-debugger"
+    ]
+}
