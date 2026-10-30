@@ -1,7 +1,8 @@
 """
-경영시스템문서 플랫폼 — Streamlit 앱. (4순위 최종단계 "문서관리" 반영, 2026-09-13)
+경영시스템문서 플랫폼 — 허브 앱(운영자용 Streamlit 앱).
+(4순위 최종단계 "문서관리" 2026-09-13 / 허브·브랜치 체제 1단계 2026-10-29)
 
-3개 화면:
+6개 화면:
   1) 기준정보 조회 — standard / sector_main / iaf_group / sector_profile / doc_type /
      form_pattern / sample_original(Original 현황)
   2) 사용자 관리 — 사용자 등록(회사·샘플 통합) / 조직 책임과 권한
@@ -12,8 +13,16 @@
      생성" 방식으로 재도입 — 사용자가 xlsx를 직접 준비할 필요 없이, 이 신청건에
      이미 등록된 문서 목록에서 기준표를 자동으로 만들어 분리한다. hwp_split.py
      참고)
+  4) 고객·발행 관리 — 고객 유형(단순/브랜치/로컬 브랜치) / 문서 발행·다운로드 키 /
+     양식 마스터(개인정보 양식 지정·기본 증빙)
+  5) 양식 실적 기록 — 기록 입력(서버 저장 또는 로컬 브랜치는 파일로만 저장·복구,
+     기록 작성 예시로 시작, 템플릿 제공) / 기록 대장(브랜치 원본은 기한부 승인 시만 열람)
+  6) 템플릿 관리 — 접수·검수 / 운영자 예시 등록 / 공개 현황·설정
+  7) 신청 접수 — 고객이 브랜치 앱에서 일괄 입력·제출한 신청 정보 접수함(출처 표시, 운영자 추정 보완,
+     생성 전 확인 필요 지정, 신청건 생성, 단계 이동) / 입력 항목 마스터(필수·선택 관리) — 14번 이후
+  (4~6은 scripts/12_migrate_hub_branch.py 실행 후 사용. 설계: claude/hub_branch_design.md)
 
-실행: (scripts 폴더에서 00~10을 먼저 실행해 DB가 준비된 상태에서)
+실행: (scripts 폴더에서 00~12를 먼저 실행해 DB가 준비된 상태에서)
     streamlit run app.py
 """
 import io
@@ -42,8 +51,11 @@ from storage_paths import (  # noqa: E402
 import gcs_storage  # noqa: E402
 import hwp_merge  # noqa: E402
 import hwp_split  # noqa: E402
+import record_utils  # noqa: E402
+import auth_utils  # noqa: E402
+import intake_core  # noqa: E402
 
-st.set_page_config(page_title="경영시스템문서 플랫폼", layout="wide")
+st.set_page_config(page_title="경영시스템문서 플랫폼 — 허브", layout="wide")
 
 # 규격 선택 (2026-09-18부터: 하드코딩된 7개 조합 대신 standard 테이블에서 동적으로
 # 읽어와 다중선택하는 방식으로 전환 — 규격이 늘어나거나 개정판(예: ISO 9001/14001
@@ -1047,12 +1059,1036 @@ def _render_verify_confirm(org_chart_id, app_id):
         st.rerun()
 
 
+# ---------- 4~6. 허브 앱 확장 (2026-10-29, 허브/브랜치 체제 1단계) ----------
+# 12번 마이그레이션(scripts/12_migrate_hub_branch.py) 이후에만 동작.
+# 설계: 프로젝트 문서 claude/hub_branch_design.md
+
+CUSTOMER_TYPE_LABEL = {"simple": "① 단순 사용자", "branch": "② 브랜치", "local_branch": "③ 로컬 브랜치"}
+EVIDENCE_TYPE_LABEL = {"erp": "ERP/정보시스템", "paper": "종이 보관", "file": "파일/공유폴더", "external": "외부기관"}
+AUTHOR_ROLE_LABEL = {"operator": "운영자 대리입력", "customer": "고객 입력"}
+
+
+def _pick(label, labels: dict, key, **kw):
+    """ID를 값으로 쓰는 selectbox(표시는 labels). 튜플 옵션보다 안정적."""
+    ids = list(labels)
+    return st.selectbox(label, ids, format_func=lambda x: labels.get(x, str(x)), key=key, **kw)
+
+
+def _app_labels():
+    return {int(i): lbl for i, lbl in _app_options_all()}
+
+
+def _hub_schema_ready():
+    try:
+        return bool(run_query("SELECT to_regclass('public.form_record') IS NOT NULL AS ok").iloc[0]["ok"])
+    except Exception:
+        return False
+
+
+def _app_options_all():
+    return fetch_options(
+        "SELECT a.application_id, a.application_id || ' - ' || a.project_no "
+        "FROM application a ORDER BY a.application_id DESC"
+    )
+
+
+def _customer_info(app_id):
+    """신청건의 회사·고객 유형. 샘플 신청건이거나 유형 미지정이면 customer_type=None."""
+    df = run_query(
+        """
+        SELECT a.application_id, a.project_no, a.company_id, a.sample_name,
+               c.company_name, ca.customer_type, p.max_private_ratio, p.template_access_rule
+        FROM application a
+        LEFT JOIN company c ON c.company_id = a.company_id
+        LEFT JOIN customer_account ca ON ca.company_id = a.company_id
+        LEFT JOIN customer_type_policy p ON p.customer_type = ca.customer_type
+        WHERE a.application_id = %s
+        """,
+        (app_id,),
+    )
+    return df.iloc[0] if len(df) else None
+
+
+def _form_docs_for_app(app_id):
+    return run_query(
+        """
+        SELECT di.doc_id, di.doc_type_id, di.revision_no, dt.doc_type_code, dt.doc_type_name,
+               dt.clause_ref, dt.is_personal_data, dt.default_evidence
+        FROM document_individual di
+        JOIN doc_type dt ON dt.doc_type_id = di.doc_type_id
+        WHERE di.application_id = %s AND dt.category = 'form'
+        ORDER BY dt.doc_type_code
+        """,
+        (app_id,),
+    )
+
+
+def _payload_from_editor(df):
+    out = {}
+    for r in df.itertuples(index=False):
+        k = "" if pd.isna(r[0]) else str(r[0]).strip()
+        if k:
+            out[k] = "" if pd.isna(r[1]) else str(r[1])
+    return out
+
+
+def _editor_df(payload):
+    rows = [{"항목": k, "값": v} for k, v in (payload or {}).items()]
+    return pd.DataFrame(rows or [{"항목": "", "값": ""}], columns=["항목", "값"])
+
+
+def _evidence_inputs(prefix, default):
+    default = default if isinstance(default, dict) else {}
+    types = list(EVIDENCE_TYPE_LABEL)
+    ev_type = st.selectbox(
+        "증빙 구분", types, format_func=lambda t: EVIDENCE_TYPE_LABEL[t],
+        index=types.index(default.get("type")) if default.get("type") in types else 0,
+        key=f"{prefix}_type",
+    )
+    c1, c2 = st.columns(2)
+    system = c1.text_input("시스템/기관명", value=default.get("system", ""), key=f"{prefix}_system")
+    location = c2.text_input("메뉴 경로/보관 위치", value=default.get("menu", default.get("location", "")),
+                             key=f"{prefix}_menu")
+    note = st.text_input("비고", value=default.get("note", ""), key=f"{prefix}_note")
+    ev = {"type": ev_type}
+    if system.strip():
+        ev["system"] = system.strip()
+    if location.strip():
+        ev["menu" if ev_type == "erp" else "location"] = location.strip()
+    if note.strip():
+        ev["note"] = note.strip()
+    return ev
+
+
+def _insert_field_usage(app_id, doc_type_id, form_rev, record_date, source, payload):
+    for r in record_utils.field_usage_rows(payload):
+        run_write(
+            "INSERT INTO form_field_usage (application_id, doc_type_id, form_revision_no, field_name, "
+            "record_date, source, is_filled, char_count, display_width, line_count, overflow, numeric_bucket) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            (app_id, doc_type_id, form_rev, r["field_name"], record_date, source, r["is_filled"],
+             r["char_count"], r["display_width"], r["line_count"], r["overflow"], r["numeric_bucket"]),
+        )
+
+
+def _active_grant(app_id):
+    df = run_query(
+        "SELECT grant_id, reason, expires_at FROM operator_access_grant WHERE application_id=%s "
+        "AND revoked_at IS NULL AND now() BETWEEN granted_at AND expires_at ORDER BY expires_at DESC LIMIT 1",
+        (app_id,),
+    )
+    return df.iloc[0] if len(df) else None
+
+
+def _render_customer_type_tab():
+    st.caption(
+        "회사(실제 고객) 단위로 고객 유형을 지정합니다. 샘플 신청건은 대상이 아닙니다. "
+        "유형별 비공개 한도 등 정책값은 아래 표(customer_type_policy)에서 관리합니다."
+    )
+    st.dataframe(
+        run_query("SELECT customer_type, type_label, max_private_ratio, template_access_rule, "
+                  "contribution_window_months, min_contribution_per_form, note "
+                  "FROM customer_type_policy ORDER BY customer_type"),
+        use_container_width=True, hide_index=True,
+    )
+    companies = run_query(
+        """
+        SELECT c.company_id, c.company_name, c.biz_reg_no, ca.customer_type, ca.terms_version,
+               ca.terms_accepted_at, COUNT(a.application_id) AS 신청건수
+        FROM company c
+        LEFT JOIN customer_account ca ON ca.company_id = c.company_id
+        LEFT JOIN application a ON a.company_id = c.company_id
+        GROUP BY c.company_id, c.company_name, c.biz_reg_no, ca.customer_type, ca.terms_version,
+                 ca.terms_accepted_at
+        ORDER BY c.company_id
+        """
+    )
+    with st.expander("➕ 신규 고객(회사) 등록 — 신청건 없이 먼저 계정을 주고 고객이 직접 신청 정보를 입력하게 할 때"):
+        c1, c2, c3 = st.columns(3)
+        nc_name = c1.text_input("회사명", key="newco_name")
+        nc_biz = c2.text_input("사업자등록번호(선택)", key="newco_biz")
+        nc_type = c3.selectbox("고객 유형", ["branch", "local_branch", "simple"],
+                               format_func=lambda t: CUSTOMER_TYPE_LABEL[t], key="newco_type")
+        if st.button("등록", key="newco_go", disabled=not nc_name.strip()):
+            if nc_biz.strip() and len(run_query("SELECT 1 FROM company WHERE biz_reg_no=%s", (nc_biz.strip(),))):
+                st.error("이미 등록된 사업자등록번호입니다.")
+            else:
+                cid = run_insert_returning("INSERT INTO company (company_name, biz_reg_no) VALUES (%s, NULLIF(%s,'')) "
+                                           "RETURNING company_id", (nc_name.strip(), nc_biz.strip()))
+                run_write("INSERT INTO customer_account (company_id, customer_type) VALUES (%s,%s)", (cid, nc_type))
+                st.success(f"{nc_name} 등록(#{cid}). [브랜치 계정] 탭에서 고객 관리자 계정을 발급하세요.")
+                st.rerun()
+    if companies.empty:
+        st.info("등록된 회사가 없습니다. 위에서 신규 고객을 등록하거나 [2. 사용자 관리]에서 신청건을 등록하세요.")
+        return
+    view = companies.copy()
+    view["고객 유형"] = view["customer_type"].map(CUSTOMER_TYPE_LABEL).fillna("미지정")
+    st.dataframe(view[["company_id", "company_name", "biz_reg_no", "고객 유형", "terms_version",
+                       "terms_accepted_at", "신청건수"]], use_container_width=True, hide_index=True)
+
+    st.markdown("**고객 유형 지정/변경**")
+    co_labels = {int(r.company_id): f"{r.company_id} - {r.company_name}" for r in companies.itertuples()}
+    co_id = _pick("회사", co_labels, "cust_type_co")
+    cur_row = companies[companies["company_id"] == co_id].iloc[0]
+    types = list(CUSTOMER_TYPE_LABEL)
+    ctype = st.radio(
+        "고객 유형", types, format_func=lambda t: CUSTOMER_TYPE_LABEL[t], horizontal=True,
+        index=types.index(cur_row["customer_type"]) if cur_row["customer_type"] in types else 0,
+        key=f"cust_type_radio_{co_id}",
+    )
+    terms = st.text_input("동의한 약관 버전(공개·익명화·검수 조항 포함)",
+                          value=cur_row["terms_version"] if pd.notna(cur_row["terms_version"]) else "",
+                          key=f"cust_type_terms_{co_id}")
+    if st.button("저장", key="cust_type_save"):
+        run_write(
+            """
+            INSERT INTO customer_account (company_id, customer_type, terms_version, terms_accepted_at)
+            VALUES (%s, %s, NULLIF(%s,''), CASE WHEN %s <> '' THEN now() END)
+            ON CONFLICT (company_id) DO UPDATE SET customer_type = EXCLUDED.customer_type,
+                terms_version = EXCLUDED.terms_version,
+                terms_accepted_at = CASE WHEN customer_account.terms_version IS DISTINCT FROM
+                                         EXCLUDED.terms_version THEN EXCLUDED.terms_accepted_at
+                                         ELSE customer_account.terms_accepted_at END,
+                updated_at = now()
+            """,
+            (co_id, ctype, terms.strip(), terms.strip()),
+        )
+        st.success(f"{co_labels[co_id]} → {CUSTOMER_TYPE_LABEL[ctype]} 저장")
+        st.rerun()
+
+
+def _render_release_tab():
+    st.caption(
+        "발행 = 지금 시점의 문서 세트(개정번호·파일 위치)를 박제하는 것입니다. 이후 개정돼도 "
+        "발행분은 그대로 재현됩니다. 단순 사용자·로컬 브랜치는 발행 + 다운로드 키로 전달합니다."
+    )
+    apps = _app_labels()
+    if not apps:
+        st.info("신청건이 없습니다.")
+        return
+    app_id = _pick("신청건", apps, "release_app")
+    info = _customer_info(app_id)
+    st.markdown(f"고객 유형: **{CUSTOMER_TYPE_LABEL.get(info['customer_type'], '미지정')}**")
+
+    docs = run_query(
+        "SELECT di.doc_id, dt.doc_type_code, dt.doc_type_name, dt.category, di.revision_no, di.storage_path "
+        "FROM document_individual di JOIN doc_type dt ON dt.doc_type_id = di.doc_type_id "
+        "WHERE di.application_id=%s AND di.storage_path IS NOT NULL ORDER BY dt.doc_type_code",
+        (app_id,),
+    )
+    st.markdown(f"발행 대상(파일이 등록된 문서): **{len(docs)}건**")
+    with st.expander("대상 문서 보기"):
+        st.dataframe(docs, use_container_width=True, hide_index=True)
+
+    c1, c2, c3 = st.columns(3)
+    days = c1.number_input("키 유효기간(일)", min_value=1, max_value=365, value=30, key="release_days")
+    max_dl = c2.number_input("최대 다운로드 횟수", min_value=1, max_value=100, value=5, key="release_maxdl")
+    note = c3.text_input("메모(예: 최초 발행 / 추가오더 개정)", key="release_note")
+    if st.button("발행 + 다운로드 키 발급", key="release_go", disabled=docs.empty):
+        import secrets
+        rel_id = run_insert_returning(
+            "INSERT INTO doc_release (application_id, released_by, note) VALUES (%s,'운영자',NULLIF(%s,'')) "
+            "RETURNING release_id",
+            (app_id, note.strip()),
+        )
+        run_write(
+            "INSERT INTO doc_release_item (release_id, doc_id, revision_no, storage_path) "
+            "SELECT %s, doc_id, revision_no, storage_path FROM document_individual "
+            "WHERE application_id=%s AND storage_path IS NOT NULL",
+            (rel_id, app_id),
+        )
+        raw = secrets.token_urlsafe(12)
+        key_text = "-".join(raw[i:i + 4] for i in range(0, len(raw), 4))
+        run_write(
+            "INSERT INTO download_key (release_id, key_hash, expires_at, max_downloads) "
+            "VALUES (%s, encode(sha256(convert_to(%s,'UTF8')),'hex'), now() + make_interval(days => %s), %s)",
+            (rel_id, key_text, int(days), int(max_dl)),
+        )
+        st.session_state["release_new_key"] = (rel_id, key_text)
+    if "release_new_key" in st.session_state:
+        rel_id, key_text = st.session_state["release_new_key"]
+        st.success(f"발행 #{rel_id} 완료. 다운로드 키는 **지금 한 번만** 표시됩니다 — 고객에게 전달하세요.")
+        st.code(key_text)
+        if st.button("확인했습니다(키 숨기기)", key="release_hide_key"):
+            del st.session_state["release_new_key"]
+            st.rerun()
+
+    st.markdown("**발행 이력**")
+    hist = run_query(
+        """
+        SELECT r.release_id, r.released_at, r.note,
+               (SELECT COUNT(*) FROM doc_release_item i WHERE i.release_id = r.release_id) AS 문서수,
+               k.key_id, k.expires_at, k.used_count, k.max_downloads, k.revoked_at,
+               CASE WHEN k.revoked_at IS NOT NULL THEN '폐기'
+                    WHEN k.expires_at < now() THEN '만료'
+                    WHEN k.used_count >= k.max_downloads THEN '횟수소진'
+                    WHEN k.key_id IS NULL THEN '-' ELSE '유효' END AS 키상태
+        FROM doc_release r LEFT JOIN download_key k ON k.release_id = r.release_id
+        WHERE r.application_id = %s ORDER BY r.release_id DESC, k.key_id DESC
+        """,
+        (app_id,),
+    )
+    if hist.empty:
+        st.caption("아직 발행 이력이 없습니다.")
+        return
+    st.dataframe(hist, use_container_width=True, hide_index=True)
+    rel_opts = sorted(hist["release_id"].unique().tolist(), reverse=True)
+    c1, c2 = st.columns(2)
+    with c1:
+        rel_pick = st.selectbox("발행분 선택", rel_opts, key="release_pick")
+        zkey = f"release_zip_{rel_pick}"
+        if st.button("발행분 zip 만들기", key="release_zip_prep"):
+            items = run_query("SELECT storage_path FROM doc_release_item WHERE release_id=%s "
+                              "AND storage_path IS NOT NULL", (int(rel_pick),))
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for p in items["storage_path"]:
+                    zf.writestr("/".join(p.split("/")[2:]) or p, gcs_storage.download_bytes(p))
+            st.session_state[zkey] = buf.getvalue()
+        if zkey in st.session_state:
+            st.download_button("zip 저장", st.session_state[zkey],
+                               file_name=f"{info['project_no']}_release{rel_pick}.zip", key="release_zip_save")
+    with c2:
+        live = hist[(hist["키상태"] == "유효")]
+        if not live.empty:
+            kid = st.selectbox("폐기할 키", live["key_id"].astype(int).tolist(), key="release_revoke_pick")
+            if st.button("키 폐기", key="release_revoke"):
+                run_write("UPDATE download_key SET revoked_at=now() WHERE key_id=%s", (int(kid),))
+                st.rerun()
+    st.caption("고객은 브랜치 앱(고객 포털) 첫 화면의 [🔑 다운로드 키로 문서 받기]에서 로그인 없이 받습니다.")
+
+
+def _render_form_master_tab():
+    st.caption(
+        "개인정보 양식으로 지정하면 고객 설정과 무관하게 항상 비공개이며, 비공개 비율 계산에서도 "
+        "빠집니다(예: 건강진단, 산업재해·사고조사, 개인별 교육훈련 기록)."
+    )
+    forms = run_query(
+        "SELECT doc_type_id, doc_type_code, doc_type_name, clause_ref, is_personal_data, default_evidence "
+        "FROM doc_type WHERE category='form' ORDER BY doc_type_code"
+    )
+    if forms.empty:
+        st.info("doc_type에 양식(category='form')이 아직 없습니다.")
+        return
+    edited = st.data_editor(
+        forms[["doc_type_id", "doc_type_code", "doc_type_name", "clause_ref", "is_personal_data"]],
+        disabled=["doc_type_id", "doc_type_code", "doc_type_name", "clause_ref"],
+        column_config={"is_personal_data": st.column_config.CheckboxColumn("개인정보 양식")},
+        use_container_width=True, hide_index=True, key="form_personal_editor",
+    )
+    if st.button("개인정보 지정 저장", key="form_personal_save"):
+        changed = 0
+        for orig, new in zip(forms.itertuples(), edited.itertuples()):
+            if bool(orig.is_personal_data) != bool(new.is_personal_data):
+                run_write("UPDATE doc_type SET is_personal_data=%s WHERE doc_type_id=%s",
+                          (bool(new.is_personal_data), int(orig.doc_type_id)))
+                changed += 1
+        st.success(f"{changed}건 변경")
+
+    st.markdown("**양식별 기본 증빙(evidence_ref 기본값)** — ERP 연속발생형 등 기록 대신 증빙으로 대체하는 양식")
+    pick_id = _pick("양식", {int(r.doc_type_id): f"{r.doc_type_code} {r.doc_type_name}"
+                             for r in forms.itertuples()}, "form_ev_pick")
+    pick = (pick_id,)
+    cur = forms[forms["doc_type_id"] == pick_id].iloc[0]["default_evidence"]
+    if isinstance(cur, str):
+        cur = json.loads(cur)
+    ev = _evidence_inputs(f"form_ev_{pick[0]}", cur)
+    c1, c2 = st.columns(2)
+    if c1.button("기본 증빙 저장", key="form_ev_save"):
+        run_write("UPDATE doc_type SET default_evidence=%s::jsonb WHERE doc_type_id=%s",
+                  (json.dumps(ev, ensure_ascii=False), int(pick[0])))
+        st.success("저장했습니다.")
+    if c2.button("기본 증빙 해제", key="form_ev_clear"):
+        run_write("UPDATE doc_type SET default_evidence=NULL WHERE doc_type_id=%s", (int(pick[0]),))
+        st.success("해제했습니다.")
+
+
+def _render_record_entry(app_id, info, forms):
+    ctype = info["customer_type"]
+    is_local = ctype == "local_branch"
+    form_labels = {int(r.doc_id): f"{r.doc_type_code} {r.doc_type_name} (Rev.{r.revision_no})"
+                   + (" 🔒개인정보" if r.is_personal_data else "") for r in forms.itertuples()}
+    pick_doc = _pick("양식", form_labels, f"rec_form_{app_id}")
+    pick = next(r for r in forms.itertuples(index=False) if int(r.doc_id) == pick_doc)
+    state_key = f"rec_prefill_{app_id}_{pick.doc_id}"
+    ver_key = state_key + "_ver"
+    st.session_state.setdefault(state_key, {})
+    st.session_state.setdefault(ver_key, 0)
+
+    def _prefill(payload, msg):
+        st.session_state[state_key] = payload
+        st.session_state[ver_key] += 1
+        st.success(msg)
+
+    # 시작 방법: 지난 기록 파일(로컬) / 공용 템플릿
+    if is_local:
+        up = st.file_uploader("지난 기록 파일로 시작(로컬 저장한 zip 또는 json)", type=["zip", "json"],
+                              key=f"rec_restore_{app_id}_{pick.doc_id}")
+        if up is not None and st.button("이 파일 값으로 채우기", key=f"rec_restore_go_{pick.doc_id}"):
+            try:
+                doc = record_utils.read_local_package(up.getvalue())
+                if doc.get("doc_type_code") != pick.doc_type_code:
+                    st.warning(f"다른 양식의 기록입니다({doc.get('doc_type_code')}). 값만 채웁니다.")
+                if not doc["hash_ok"]:
+                    st.warning("파일 내용이 내려받은 뒤 수정되었습니다(해시 불일치). 값은 그대로 채웁니다.")
+                _prefill(doc["payload"], f"{doc.get('record_date', '')} 기록으로 채웠습니다. 바뀐 부분만 고치세요.")
+            except ValueError as e:
+                st.error(str(e))
+    visible = run_query(
+        "SELECT 1 FROM v_template_visible_form WHERE application_id=%s AND doc_type_id=%s",
+        (app_id, int(pick.doc_type_id)),
+    )
+    tmpl = run_query(
+        "SELECT template_id, source, anonymized_payload FROM record_template "
+        "WHERE doc_type_id=%s AND is_published ORDER BY source DESC, template_id DESC",
+        (int(pick.doc_type_id),),
+    )
+    if not tmpl.empty:
+        if visible.empty:
+            st.caption(f"📋 이 양식의 기록 작성 예시 {len(tmpl)}건이 있지만, 이 신청건은 아직 활용 자격이 "
+                       "없습니다([6. 템플릿 관리 → 공개 현황] 참고).")
+        else:
+            tid = _pick("📋 기록 작성 예시",
+                        {int(r.template_id): f"예시 #{r.template_id} ({'운영자' if r.source == 'operator' else '고객 제공'})"
+                         for r in tmpl.itertuples()}, f"rec_tmpl_{pick.doc_id}")
+            t = next(r for r in tmpl.itertuples(index=False) if int(r.template_id) == tid)
+            if st.button("이 예시로 시작", key=f"rec_tmpl_go_{pick.doc_id}"):
+                p = t.anonymized_payload if isinstance(t.anonymized_payload, dict) else json.loads(t.anonymized_payload)
+                _prefill(p, "예시 값으로 채웠습니다.")
+
+    rec_date = st.date_input("기록일", value=date.today(), key=f"rec_date_{pick.doc_id}")
+    st.caption("양식별 필드 정의(5순위)가 확정되기 전까지는 '항목/값' 형태로 입력합니다. 행 추가는 표 아래 '+'.")
+    edited = st.data_editor(
+        _editor_df(st.session_state[state_key]), num_rows="dynamic", use_container_width=True,
+        key=f"rec_editor_{pick.doc_id}_{st.session_state[ver_key]}",
+    )
+    payload = _payload_from_editor(edited)
+    default_ev = pick.default_evidence if isinstance(pick.default_evidence, dict) else (
+        json.loads(pick.default_evidence) if isinstance(pick.default_evidence, str) else None)
+    use_ev = st.checkbox("ERP 등 외부 증빙으로 대체(증빙 위치 기록)", value=bool(default_ev),
+                         key=f"rec_use_ev_{pick.doc_id}")
+    evidence = _evidence_inputs(f"rec_ev_{pick.doc_id}", default_ev) if use_ev else None
+    author = st.radio("작성 주체", list(AUTHOR_ROLE_LABEL), format_func=lambda r: AUTHOR_ROLE_LABEL[r],
+                      index=1 if ctype else 0, horizontal=True, key=f"rec_author_{pick.doc_id}")
+    if not payload and not evidence:
+        st.caption("값이나 증빙 중 하나 이상을 입력하세요.")
+        return
+
+    if not is_local:
+        if st.button("기록 저장", type="primary", key=f"rec_save_{pick.doc_id}"):
+            rid = run_insert_returning(
+                "INSERT INTO form_record (application_id, doc_id, form_revision_no, record_date, entry_app, "
+                "author_role, evidence_ref) VALUES (%s,%s,%s,%s,'hub',%s,%s::jsonb) RETURNING record_id",
+                (app_id, int(pick.doc_id), int(pick.revision_no), rec_date, author,
+                 json.dumps(evidence, ensure_ascii=False) if evidence else None),
+            )
+            run_write("INSERT INTO form_record_payload (record_id, payload, payload_hash) VALUES (%s,%s::jsonb,%s)",
+                      (rid, json.dumps(payload, ensure_ascii=False), record_utils.payload_hash(payload)))
+            _insert_field_usage(app_id, int(pick.doc_type_id), int(pick.revision_no), rec_date, "hub", payload)
+            st.session_state[state_key] = {}
+            st.session_state[ver_key] += 1
+            st.success(f"기록 #{rid} 저장(서버, 허브·브랜치 공유)")
+        return
+
+    # 로컬 브랜치: 서버에 저장하지 않고 파일로 내려줌
+    st.info("로컬 브랜치 고객입니다 — 기록 값은 서버에 저장되지 않고, 아래 파일로만 저장됩니다.")
+    pkg_key = f"rec_pkg_{pick.doc_id}"
+    if st.button("기록 파일 만들기", type="primary", key=f"rec_pkg_go_{pick.doc_id}"):
+        meta = {"project_no": info["project_no"], "doc_type_code": pick.doc_type_code,
+                "doc_type_name": pick.doc_type_name, "form_revision_no": int(pick.revision_no),
+                "record_date": rec_date.isoformat(), "evidence_ref": evidence}
+        st.session_state[pkg_key] = record_utils.build_local_package(meta, payload)
+        # 내용 없이 길이 정보만 남김(양식 개선용 메타데이터)
+        _insert_field_usage(app_id, int(pick.doc_type_id), int(pick.revision_no), rec_date, "local_upload", payload)
+    if pkg_key in st.session_state:
+        st.download_button("기록 파일 저장(zip)", st.session_state[pkg_key],
+                           file_name=f"{pick.doc_type_code}_{rec_date.isoformat()}.zip",
+                           key=f"rec_pkg_save_{pick.doc_id}")
+
+    if pick.is_personal_data or not payload:
+        return
+    with st.expander("이 건을 공용 템플릿으로 제공(선택)"):
+        st.caption("익명화된 결과를 확인한 뒤 제공하면 운영자 검수 후 게시됩니다. 제공한 양식은 "
+                   "템플릿 활용 자격(최근 12개월 승인 제출)에 반영됩니다.")
+        extra = st.text_input("추가로 가릴 단어(담당자명·거래처명 등, 쉼표 구분)", key=f"rec_anon_terms_{pick.doc_id}")
+        terms = [info["company_name"] if pd.notna(info["company_name"]) else ""] + [t for t in extra.split(",") if t.strip()]
+        anon = record_utils.anonymize_payload(payload, terms)
+        st.json(anon)
+        if st.button("이 내용으로 제공", key=f"rec_contrib_{pick.doc_id}"):
+            run_write(
+                "INSERT INTO record_template (doc_type_id, source, contributor_application_id, form_revision_no, "
+                "anonymized_payload) VALUES (%s,'customer',%s,%s,%s::jsonb)",
+                (int(pick.doc_type_id), app_id, int(pick.revision_no), json.dumps(anon, ensure_ascii=False)),
+            )
+            st.success("제공했습니다(검수 대기).")
+
+
+def _render_record_ledger(app_id, info):
+    if info["customer_type"] == "local_branch":
+        st.info("로컬 브랜치 고객의 기록은 고객 PC에만 있어 서버 대장이 없습니다.")
+        return
+    recs = run_query(
+        """
+        SELECT r.record_id, dt.doc_type_code, dt.doc_type_name, r.form_revision_no, r.record_date,
+               r.entry_app, r.author_role, r.evidence_ref->>'type' AS 증빙구분, r.created_at
+        FROM form_record r
+        JOIN document_individual di ON di.doc_id = r.doc_id
+        JOIN doc_type dt ON dt.doc_type_id = di.doc_type_id
+        WHERE r.application_id = %s AND NOT r.is_deleted
+        ORDER BY r.record_date DESC, r.record_id DESC
+        """,
+        (app_id,),
+    )
+    if recs.empty:
+        st.caption("저장된 기록이 없습니다.")
+        return
+    st.dataframe(recs, use_container_width=True, hide_index=True)
+
+    st.markdown("**기록 내용 보기**")
+    needs_grant = info["customer_type"] == "branch"
+    grant = _active_grant(app_id) if needs_grant else None
+    if needs_grant and grant is None:
+        st.warning("브랜치 고객의 실적 원본은 고객이 승인한 기한부 접근 중에만 볼 수 있습니다.")
+    else:
+        rid = st.selectbox("기록", recs["record_id"].astype(int).tolist(), key=f"ledger_pick_{app_id}")
+        if st.button("내용 열기", key=f"ledger_open_{app_id}"):
+            p = run_query("SELECT payload FROM form_record_payload WHERE record_id=%s", (rid,))
+            if needs_grant:
+                run_write(
+                    "INSERT INTO operator_access_log (application_id, grant_id, action, target_table, target_id) "
+                    "VALUES (%s,%s,'view_payload','form_record_payload',%s)",
+                    (app_id, int(grant["grant_id"]), rid),
+                )
+            st.json(p.iloc[0]["payload"] if len(p) else {})
+            if needs_grant:
+                st.caption("이 조회는 운영자 접근 기록에 남고, 고객이 브랜치 앱에서 확인할 수 있습니다.")
+
+    if needs_grant:
+        with st.expander("운영자 접근 승인 등록(고객 승인 내용 기록)"):
+            st.caption("원칙은 고객 관리자가 브랜치 앱 [🕵 운영자 접근]에서 직접 승인하는 것입니다. 서면/메일로 승인받은 경우에만 여기 기록합니다.")
+            reason = st.text_input("사유(예: 데이터 오류 지원 요청)", key=f"grant_reason_{app_id}")
+            gdays = st.number_input("기간(일)", 1, 30, 3, key=f"grant_days_{app_id}")
+            if st.button("승인 등록", key=f"grant_save_{app_id}", disabled=not reason.strip()):
+                run_write("INSERT INTO operator_access_grant (application_id, reason, expires_at) "
+                          "VALUES (%s,%s, now() + make_interval(days => %s))", (app_id, reason.strip(), int(gdays)))
+                st.rerun()
+            if grant is not None:
+                st.caption(f"현재 유효한 승인: {grant['reason']} (~{grant['expires_at']})")
+
+
+def _render_disclosure_status():
+    apps = _app_labels()
+    if not apps:
+        return
+    st.markdown("**신청건별 템플릿 활용 자격**")
+    st.dataframe(
+        run_query(
+            "SELECT t.application_id, a.project_no, t.customer_type, t.eligible_forms AS 대상양식, "
+            "t.private_forms AS 비공개, t.personal_forms AS 개인정보, t.private_ratio AS 비공개비율, "
+            "t.max_private_ratio AS 한도, t.public_forms_contributed AS 제출완료공개양식, "
+            "t.full_template_access AS 전체활용 "
+            "FROM v_template_access t JOIN application a USING (application_id) ORDER BY 1 DESC"
+        ),
+        use_container_width=True, hide_index=True,
+    )
+
+    st.markdown("**양식별 공개/비공개 설정** (브랜치 고객은 향후 브랜치 앱에서 직접 설정, 로컬 고객은 여기서 대리 설정)")
+    app_id = _pick("신청건", apps, "disc_app")
+    info = _customer_info(app_id)
+    if info["customer_type"] not in ("branch", "local_branch"):
+        st.caption("브랜치·로컬 브랜치 고객만 대상입니다.")
+        return
+    status = run_query(
+        "SELECT doc_type_id, doc_type_code, clause_ref, is_personal_data, is_private, recent_contributions "
+        "FROM v_form_disclosure_status WHERE application_id=%s ORDER BY doc_type_code",
+        (app_id,),
+    )
+    if status.empty:
+        st.caption("이 신청건에 등록된 양식이 없습니다.")
+        return
+    edited = st.data_editor(
+        status, disabled=["doc_type_id", "doc_type_code", "clause_ref", "is_personal_data", "recent_contributions"],
+        column_config={"is_private": st.column_config.CheckboxColumn("비공개"),
+                       "is_personal_data": st.column_config.CheckboxColumn("개인정보(항상 비공개)"),
+                       "recent_contributions": "최근 승인 제출"},
+        use_container_width=True, hide_index=True, key=f"disc_editor_{app_id}",
+    )
+    eligible = edited[~edited["is_personal_data"]]
+    n_priv = int(eligible["is_private"].sum())
+    ratio = n_priv / len(eligible) if len(eligible) else 0
+    limit = float(info["max_private_ratio"])
+    st.markdown(f"비공개 {n_priv}/{len(eligible)} = **{ratio:.0%}** (한도 {limit:.0%})")
+    if st.button("공개 설정 저장", key=f"disc_save_{app_id}", disabled=ratio > limit):
+        for r in edited[~edited["is_personal_data"]].itertuples():
+            run_write(
+                "INSERT INTO form_disclosure_setting (application_id, doc_type_id, is_private) VALUES (%s,%s,%s) "
+                "ON CONFLICT (application_id, doc_type_id) DO UPDATE SET is_private=EXCLUDED.is_private, updated_at=now()",
+                (app_id, int(r.doc_type_id), bool(r.is_private)),
+            )
+        st.success("저장했습니다.")
+        st.rerun()
+    if ratio > limit:
+        st.error("비공개 비율이 한도를 넘어 저장할 수 없습니다.")
+
+
+def _render_template_review():
+    c1, c2 = st.columns([2, 3])
+    if c1.button("브랜치 공개 기록에서 후보 생성", key="tmpl_harvest"):
+        cands = run_query(
+            """
+            SELECT r.record_id, r.application_id, di.doc_type_id, r.form_revision_no, p.payload, c.company_name
+            FROM form_record r
+            JOIN form_record_payload p ON p.record_id = r.record_id
+            JOIN document_individual di ON di.doc_id = r.doc_id
+            JOIN application a ON a.application_id = r.application_id
+            JOIN company c ON c.company_id = a.company_id
+            JOIN v_form_disclosure_status s
+              ON s.application_id = r.application_id AND s.doc_type_id = di.doc_type_id
+            WHERE s.customer_type = 'branch' AND NOT s.is_private AND NOT r.is_deleted
+              AND NOT EXISTS (SELECT 1 FROM record_template t WHERE t.source_record_id = r.record_id)
+            """
+        )
+        for r in cands.itertuples():
+            payload = r.payload if isinstance(r.payload, dict) else json.loads(r.payload)
+            anon = record_utils.anonymize_payload(payload, [r.company_name])
+            run_write(
+                "INSERT INTO record_template (doc_type_id, source, contributor_application_id, source_record_id, "
+                "form_revision_no, anonymized_payload) VALUES (%s,'customer',%s,%s,%s,%s::jsonb)",
+                (int(r.doc_type_id), int(r.application_id), int(r.record_id), int(r.form_revision_no),
+                 json.dumps(anon, ensure_ascii=False)),
+            )
+        st.success(f"후보 {len(cands)}건 생성(익명화 완료, 검수 대기)")
+    c2.caption("브랜치 고객의 공개 양식 기록을 자동 익명화(회사명·연락처·이메일·사업자번호 제거, 숫자 구간화)해 "
+               "검수 대기 목록에 넣습니다. 로컬 고객 제공분은 [5. 양식 실적 기록]에서 들어옵니다.")
+
+    status_pick = st.radio("상태", ["submitted", "approved", "rejected"], horizontal=True,
+                           format_func=lambda s: {"submitted": "검수 대기", "approved": "승인", "rejected": "반려"}[s],
+                           key="tmpl_status")
+    rows = run_query(
+        """
+        SELECT t.template_id, t.source, dt.doc_type_code, dt.doc_type_name, a.project_no,
+               t.anonymized_payload, t.is_published, t.submitted_at, t.review_note
+        FROM record_template t
+        JOIN doc_type dt ON dt.doc_type_id = t.doc_type_id
+        LEFT JOIN application a ON a.application_id = t.contributor_application_id
+        WHERE t.status = %s ORDER BY t.template_id DESC LIMIT 50
+        """,
+        (status_pick,),
+    )
+    if rows.empty:
+        st.caption("해당 항목이 없습니다.")
+        return
+    for r in rows.itertuples():
+        title = (f"#{r.template_id} {r.doc_type_code} {r.doc_type_name} — "
+                 f"{'운영자 예시' if r.source == 'operator' else r.project_no}"
+                 + (" · 게시중" if r.is_published else ""))
+        with st.expander(title):
+            st.json(r.anonymized_payload)
+            note = st.text_input("검수 메모", value=r.review_note if pd.notna(r.review_note) else "", key=f"tmpl_note_{r.template_id}")
+            b1, b2, b3 = st.columns(3)
+            if status_pick != "approved" and b1.button("승인", key=f"tmpl_ok_{r.template_id}"):
+                run_write("UPDATE record_template SET status='approved', reviewed_at=now(), review_note=NULLIF(%s,'') "
+                          "WHERE template_id=%s", (note, r.template_id))
+                st.rerun()
+            if status_pick != "rejected" and b2.button("반려", key=f"tmpl_ng_{r.template_id}"):
+                run_write("UPDATE record_template SET status='rejected', is_published=false, reviewed_at=now(), "
+                          "review_note=NULLIF(%s,'') WHERE template_id=%s", (note, r.template_id))
+                st.rerun()
+            if status_pick == "approved" and b3.button("게시 해제" if r.is_published else "게시",
+                                                       key=f"tmpl_pub_{r.template_id}"):
+                run_write("UPDATE record_template SET is_published = NOT is_published WHERE template_id=%s",
+                          (r.template_id,))
+                st.rerun()
+
+
+def _render_operator_example():
+    st.caption("초기에는 고객 제공분이 없으므로 운영자가 작성한 예시로 템플릿 코너를 먼저 채웁니다.")
+    forms = run_query("SELECT doc_type_id, doc_type_code, doc_type_name FROM doc_type "
+                      "WHERE category='form' ORDER BY doc_type_code")
+    if forms.empty:
+        st.info("doc_type에 양식이 없습니다.")
+        return
+    pick_id = _pick("양식", {int(r.doc_type_id): f"{r.doc_type_code} {r.doc_type_name}"
+                             for r in forms.itertuples()}, "opex_form")
+    ver = st.session_state.setdefault("opex_ver", 0)
+    edited = st.data_editor(_editor_df({}), num_rows="dynamic", use_container_width=True, key=f"opex_editor_{ver}")
+    publish = st.checkbox("바로 게시", value=True, key="opex_publish")
+    payload = _payload_from_editor(edited)
+    if st.button("예시 등록", key="opex_save", disabled=not payload):
+        run_write(
+            "INSERT INTO record_template (doc_type_id, source, anonymized_payload, status, is_published, reviewed_at) "
+            "VALUES (%s,'operator',%s::jsonb,'approved',%s, now())",
+            (pick_id, json.dumps(payload, ensure_ascii=False), publish),
+        )
+        st.session_state["opex_ver"] += 1
+        st.success("등록했습니다.")
+        st.rerun()
+
+
+def _render_branch_account_tab():
+    st.caption(
+        "브랜치·로컬 브랜치 고객의 첫 **고객 관리자** 계정을 발급합니다. 이후 직원 계정은 고객 관리자가 "
+        "브랜치 앱(👥 사용자 관리)에서 직접 만듭니다. 임시 비밀번호는 첫 로그인 때 변경이 강제됩니다."
+    )
+    if not bool(run_query("SELECT to_regclass('public.customer_file') IS NOT NULL AS ok").iloc[0]["ok"]):
+        st.error("먼저 `python scripts/13_migrate_branch_app.py`를 실행하세요.")
+        return
+    cos = run_query(
+        "SELECT c.company_id, c.company_name, ca.customer_type FROM company c "
+        "JOIN customer_account ca ON ca.company_id = c.company_id "
+        "WHERE ca.customer_type IN ('branch','local_branch') ORDER BY c.company_id"
+    )
+    if cos.empty:
+        st.info("브랜치/로컬 브랜치로 지정된 회사가 없습니다. [고객 유형] 탭에서 먼저 지정하세요.")
+    else:
+        co_id = _pick("회사", {int(r.company_id): f"{r.company_id} - {r.company_name} "
+                                                 f"({CUSTOMER_TYPE_LABEL[r.customer_type]})" for r in cos.itertuples()},
+                      "bacct_co")
+        users = run_query("SELECT user_id, login_id, display_name, role, is_active, must_change_password, "
+                          "last_login_at FROM app_user WHERE company_id=%s ORDER BY user_id", (co_id,))
+        st.dataframe(users, use_container_width=True, hide_index=True)
+        c1, c2 = st.columns(2)
+        lid = c1.text_input("고객 관리자 아이디", key=f"bacct_id_{co_id}")
+        name = c2.text_input("이름", key=f"bacct_name_{co_id}")
+        if st.button("계정 발급", key="bacct_create", disabled=not lid.strip()):
+            if len(run_query("SELECT 1 FROM app_user WHERE login_id=%s", (lid.strip(),))):
+                st.error("이미 사용 중인 아이디입니다.")
+            else:
+                pw = auth_utils.temp_password()
+                run_write(
+                    "INSERT INTO app_user (company_id, role, login_id, display_name, password_hash, must_change_password) "
+                    "VALUES (%s,'customer_admin',%s,NULLIF(%s,''),%s,true)",
+                    (co_id, lid.strip(), name.strip(), auth_utils.hash_password(pw)),
+                )
+                st.session_state["bacct_pw"] = (lid.strip(), pw)
+        if len(users):
+            uid = _pick("비밀번호 초기화 대상", {int(r.user_id): r.login_id for r in users.itertuples()}, "bacct_reset_pick")
+            if st.button("임시 비밀번호로 초기화", key="bacct_reset"):
+                pw = auth_utils.temp_password()
+                run_write("UPDATE app_user SET password_hash=%s, must_change_password=true, is_active=true "
+                          "WHERE user_id=%s", (auth_utils.hash_password(pw), uid))
+                st.session_state["bacct_pw"] = (users.set_index("user_id").loc[uid, "login_id"], pw)
+        if "bacct_pw" in st.session_state:
+            who, pw = st.session_state["bacct_pw"]
+            st.success(f"{who} 임시 비밀번호 — 지금 한 번만 표시됩니다. 고객에게 전달하세요.")
+            st.code(pw)
+            if st.button("확인했습니다(숨기기)", key="bacct_hide"):
+                del st.session_state["bacct_pw"]
+                st.rerun()
+
+    st.divider()
+    st.markdown("**최근 고객이 개정한 문서** (브랜치 앱에서 개정 → 이 허브에도 같은 행으로 반영됨)")
+    st.dataframe(
+        run_query(
+            "SELECT l.changed_at, a.project_no, dt.doc_type_code, dt.doc_type_name, l.revision_no, l.change_note, "
+            "u.display_name AS 개정자 FROM document_revision_log l "
+            "JOIN document_individual di ON di.doc_id = l.doc_id "
+            "JOIN application a ON a.application_id = di.application_id "
+            "JOIN doc_type dt ON dt.doc_type_id = di.doc_type_id "
+            "LEFT JOIN app_user u ON u.user_id = l.author_user_id "
+            "WHERE l.author_role = 'customer' ORDER BY l.log_id DESC LIMIT 50"
+        ),
+        use_container_width=True, hide_index=True,
+    )
+
+
+def render_hub_customer_page():
+    st.header("고객·발행 관리")
+    t1, t2, t3, t4 = st.tabs(["고객 유형", "브랜치 계정", "문서 발행·다운로드 키", "양식 마스터(개인정보·기본 증빙)"])
+    with t1:
+        _render_customer_type_tab()
+    with t2:
+        _render_branch_account_tab()
+    with t3:
+        _render_release_tab()
+    with t4:
+        _render_form_master_tab()
+
+
+def render_hub_record_page():
+    st.header("양식 실적 기록")
+    apps = _app_labels()
+    if not apps:
+        st.info("신청건이 없습니다.")
+        return
+    app_id = _pick("신청건", apps, "rec_app")
+    info = _customer_info(app_id)
+    ctype = info["customer_type"]
+    st.markdown(f"고객 유형: **{CUSTOMER_TYPE_LABEL.get(ctype, '미지정(샘플/유형 미지정 — 서버 저장으로 처리)')}**")
+    if ctype == "simple":
+        st.info("단순 사용자는 양식 실적 기록 대상이 아닙니다(문서 발행으로 종결).")
+        return
+    forms = _form_docs_for_app(app_id)
+    if forms.empty:
+        st.info("이 신청건에 등록된 양식 문서가 없습니다. [3. 문서관리]에서 양식을 먼저 등록하세요.")
+        return
+    t1, t2 = st.tabs(["✍ 기록 입력", "📊 기록 대장"])
+    with t1:
+        _render_record_entry(app_id, info, forms)
+    with t2:
+        _render_record_ledger(app_id, info)
+
+
+def render_hub_template_page():
+    st.header("템플릿 관리")
+    t1, t2, t3 = st.tabs(["접수·검수", "운영자 예시 등록", "공개 현황·설정"])
+    with t1:
+        _render_template_review()
+    with t2:
+        _render_operator_example()
+    with t3:
+        _render_disclosure_status()
+
+
+# ---------- 7. 신청 접수 (입력은 고객, 생성은 운영자 — 14번 마이그레이션) ----------
+
+def _hub_providers():
+    return intake_core.make_providers(run_query)
+
+
+def _intake_schema_ready():
+    try:
+        return bool(run_query("SELECT to_regclass('public.intake_request') IS NOT NULL AS ok").iloc[0]["ok"])
+    except Exception:
+        return False
+
+
+def _intake_fields_all():
+    return run_query("SELECT * FROM intake_field ORDER BY section_seq, sort_order").to_dict("records")
+
+
+def _intake_log(intake_id, frm, to, note=None):
+    run_write("INSERT INTO intake_stage_log (intake_id, from_stage, to_stage, actor_role, note) "
+              "VALUES (%s,%s,%s,'operator',%s)", (intake_id, frm, to, note))
+
+
+def _create_application_from_intake(req, values):
+    """접수된 신청 정보로 신청건 생성 — 허브 [사용자 등록]과 같은 project_no·업종코드 규칙."""
+    stds = values.get("standards") or []
+    main = values.get("sector_main")
+    if not stds or not main:
+        return None, "규격과 산업 대분류가 있어야 신청건을 만들 수 있습니다."
+    std_norm = build_std_combo(stds, _fetch_active_standards())
+    profile_id = values.get("sector_profile") or None
+    if profile_id:
+        row = run_query("SELECT sector_code, profile_seq FROM sector_profile WHERE profile_id=%s", (int(profile_id),))
+        sector_code = row.iloc[0]["sector_code"]
+        sector_suffix = f"{sector_code}{int(row.iloc[0]['profile_seq']):02d}"
+    else:
+        prefix = f"{main}00z"   # 대분류만 확정 → 미정 임시코드(7차 규칙)
+        n = int(run_query("SELECT COUNT(*) AS n FROM application WHERE sector_code LIKE %s",
+                          (f"{prefix}%",)).iloc[0]["n"])
+        sector_code = sector_suffix = f"{prefix}{n + 1:02d}"
+    name = (values.get("company_name") or req["company_name"]).strip()
+    project_no = f"{std_norm}{sector_suffix}_{name}"
+    try:
+        app_id = run_insert_returning(
+            "INSERT INTO application (company_id, project_no, std_code_normalized, active_stds, sector_code, "
+            "profile_id, org_scale) VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING application_id",
+            (int(req["company_id"]), project_no, std_norm, json.dumps(stds, ensure_ascii=False), sector_code,
+             int(profile_id) if profile_id else None, values.get("org_scale") or None),
+        )
+    except Exception as e:  # noqa: BLE001
+        if "duplicate key" in str(e).lower():
+            return None, f"같은 project_no({project_no})가 이미 있습니다."
+        return None, f"생성 오류: {e}"
+    run_write("UPDATE intake_request SET application_id=%s WHERE intake_id=%s", (app_id, int(req["intake_id"])))
+    # 회사 정보 보완(비어 있던 사업자번호 등)
+    try:
+        run_write("UPDATE company SET company_name=%s, biz_reg_no=COALESCE(biz_reg_no, NULLIF(%s,'')) "
+                  "WHERE company_id=%s", (name, values.get("biz_reg_no") or "", int(req["company_id"])))
+    except Exception:  # noqa: BLE001  사업자번호 중복 등은 무시(신청건 생성은 유지)
+        pass
+    return app_id, project_no
+
+
+def _render_intake_detail(intake_id):
+    req = run_query(
+        "SELECT r.*, c.company_name, a.project_no FROM intake_request r JOIN company c USING (company_id) "
+        "LEFT JOIN application a ON a.application_id = r.application_id WHERE r.intake_id=%s", (intake_id,)
+    ).iloc[0]
+    stage = req["stage"]
+    fields = [f for f in _intake_fields_all() if f["is_active"]]
+    vals = run_query("SELECT * FROM intake_value WHERE intake_id=%s", (intake_id,))
+    values = {r.field_code: r.value for r in vals.itertuples()}
+    files = run_query("SELECT * FROM intake_file WHERE intake_id=%s ORDER BY file_id", (intake_id,))
+    meta = vals.set_index("field_code") if len(vals) else pd.DataFrame()
+    fc = files.groupby("field_code").size().to_dict() if len(files) else {}
+
+    st.markdown(f"**{req['company_name']}** · {intake_core.STAGE_LABEL[stage]}"
+                + (f" · 신청건 `{req['project_no']}`" if pd.notna(req["project_no"]) else " · 신청건 미생성"))
+    missing = intake_core.missing_required(fields, values, fc)
+    if missing:
+        st.warning("필수 미입력: " + ", ".join(missing))
+
+    rows = []
+    for f in fields:
+        if not intake_core.is_visible(f, values):
+            continue
+        code = f["field_code"]
+        m = meta.loc[code] if code in meta.index else None
+        if f["input_type"] == "file":
+            shown = ", ".join(files[files["field_code"] == code]["file_name"]) if len(files) else ""
+        else:
+            shown = intake_core.display_value(f, values.get(code))
+        rows.append({
+            "구분": f["section"], "항목": f["label"] + (" *" if f["is_required"] else ""), "내용": shown or "—",
+            "출처": intake_core.SOURCE_LABEL.get(m["source"], "") if m is not None else "",
+            "확인": intake_core.CONFIRM_LABEL.get(m["confirm_status"], "") if m is not None and pd.notna(m["confirm_status"]) else "",
+            "고객 의견": m["customer_comment"] if m is not None and pd.notna(m["customer_comment"]) else "",
+            "유추 방법": ((f["infer_note"] or "")
+                        if not intake_core.is_filled(f, values.get(code), fc.get(code, 0)) else ""),
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    if len(files):
+        with st.expander(f"첨부 파일 {len(files)}개"):
+            fid = _pick("파일", {int(r.file_id): r.file_name for r in files.itertuples()}, f"ihub_file_{intake_id}")
+            fk = f"ihub_file_dl_{fid}"
+            if st.button("받기 준비", key=f"ihub_file_prep_{intake_id}"):
+                st.session_state[fk] = gcs_storage.download_bytes(files.set_index("file_id").loc[fid, "storage_path"])
+            if fk in st.session_state:
+                st.download_button("저장", st.session_state[fk], file_name=files.set_index("file_id").loc[fid, "file_name"],
+                                   key=f"ihub_file_save_{intake_id}")
+
+    # --- 운영자 보완(추정·판단) ---
+    if stage in ("submitted", "completing", "generating", "customer_review"):
+        st.markdown("**항목 보완/수정** — 비어 있는 선택 항목을 판단해 채우면 출처가 '운영자 추정'으로 남고, "
+                    "고객 확인 단계에서 고객에게 [맞음/수정]으로 보여집니다.")
+        editable = {f["field_code"]: f["label"] for f in fields
+                    if f["input_type"] != "file" and intake_core.is_visible(f, values)}
+        code = _pick("항목", editable, f"ihub_field_{intake_id}")
+        f = next(x for x in fields if x["field_code"] == code)
+        newv = intake_core.render_field(st, f, values.get(code), values, _hub_providers(), f"ihub_edit_{intake_id}_{code}")
+        m = meta.loc[code] if code in meta.index else None
+        c1, c2 = st.columns(2)
+        need_confirm = c1.checkbox("생성 전에 고객 확인 필요(예외)", value=bool(m["confirm_required"]) if m is not None else False,
+                                   key=f"ihub_cr_{intake_id}_{code}")
+        applied_fix = False
+        if m is not None and m["confirm_status"] == "corrected":
+            applied_fix = c2.checkbox(f"고객 수정 의견 반영함: {m['customer_comment']}", key=f"ihub_fix_{intake_id}_{code}")
+        if st.button("이 항목 저장", key=f"ihub_save_{intake_id}"):
+            if code == "sector_profile" and newv == intake_core.NO_PROFILE:
+                newv = None
+            src = "customer_confirmed" if applied_fix else "operator_inferred"
+            run_write(
+                "INSERT INTO intake_value (intake_id, field_code, value, source, confirm_required, confirm_status, "
+                "updated_role) VALUES (%s,%s,%s::jsonb,%s,%s,%s,'operator') ON CONFLICT (intake_id, field_code) DO UPDATE SET "
+                "value=EXCLUDED.value, source=EXCLUDED.source, confirm_required=EXCLUDED.confirm_required, "
+                "confirm_status=EXCLUDED.confirm_status, updated_role='operator', updated_by_user_id=NULL, updated_at=now()",
+                (intake_id, code, json.dumps(newv, ensure_ascii=False), src, need_confirm,
+                 "pending" if need_confirm else ("confirmed" if applied_fix else None)),
+            )
+            st.success("저장했습니다.")
+            st.rerun()
+
+    # --- 신청건 생성 ---
+    if pd.isna(req["application_id"]) and stage in ("submitted", "completing"):
+        st.divider()
+        st.markdown("**신청건 생성** — 접수 내용으로 허브 신청건을 만듭니다(이후 [2. 사용자 관리]에서 업종 프로필 등 보정 가능, "
+                    "조직·책임과 권한 → 문서 생성으로 진행).")
+        if st.button("신청건 생성", key=f"ihub_mkapp_{intake_id}"):
+            app_id, msg = _create_application_from_intake(req, values)
+            (st.success if app_id else st.error)(f"신청건 #{app_id} 생성: {msg}" if app_id else msg)
+            if app_id:
+                st.rerun()
+
+    # --- 단계 이동 ---
+    st.divider()
+    pending = int((vals["confirm_status"] == "pending").sum()) if len(vals) else 0
+    note = st.text_input("메모(단계 이력에 남음)", key=f"ihub_note_{intake_id}")
+    c1, c2 = st.columns(2)
+    nxt = {"submitted": "completing", "completing": "generating", "generating": "customer_review",
+           "customer_review": "finalized"}.get(stage)
+    block = None
+    if nxt == "generating" and pending:
+        block = f"고객 확인 대기 {pending}건(생성 전 확인 필요)이 남아 있습니다."
+    if nxt == "generating" and pd.isna(req["application_id"]):
+        block = "먼저 신청건을 생성하세요."
+    if nxt == "generating" and missing:
+        block = "필수 항목이 비어 있습니다(운영자가 보완하거나 고객 확인 요청)."
+    if nxt:
+        if block:
+            c1.caption("⛔ " + block)
+        if c1.button(f"→ {intake_core.STAGE_LABEL[nxt]}", type="primary", key=f"ihub_next_{intake_id}",
+                     disabled=bool(block)):
+            if nxt == "finalized":
+                run_write("UPDATE intake_value SET confirm_status='auto_accepted' WHERE intake_id=%s "
+                          "AND source='operator_inferred' AND (confirm_status IS NULL OR confirm_status='pending')",
+                          (intake_id,))
+                run_write("UPDATE intake_request SET finalized_at=now() WHERE intake_id=%s", (intake_id,))
+            run_write("UPDATE intake_request SET stage=%s WHERE intake_id=%s AND stage=%s", (nxt, intake_id, stage))
+            _intake_log(intake_id, stage, nxt, note or None)
+            st.rerun()
+    if stage in ("submitted", "completing"):
+        if c2.button("↩ 고객 입력중으로 되돌리기", key=f"ihub_back_{intake_id}", disabled=not note.strip()):
+            run_write("UPDATE intake_request SET stage='draft' WHERE intake_id=%s", (intake_id,))
+            _intake_log(intake_id, stage, "draft", note)
+            st.rerun()
+        c2.caption("되돌리기는 꼭 필요할 때만(사유 메모 필수). 보통은 운영자가 보완하고 고객 확인 단계에서 한 번에 확인받습니다.")
+    with st.expander("단계 이력"):
+        st.dataframe(run_query("SELECT changed_at, from_stage, to_stage, actor_role, note FROM intake_stage_log "
+                               "WHERE intake_id=%s ORDER BY log_id", (intake_id,)), use_container_width=True, hide_index=True)
+
+
+def _render_intake_field_master():
+    st.caption("신청 정보 입력 항목의 필수/선택, 표시 여부, 순서, 안내 문구를 관리합니다. 변경은 고객 화면에 바로 반영됩니다.")
+    df = run_query("SELECT field_code, section, label, input_type, is_required, is_active, sort_order, help_text, "
+                   "infer_note FROM intake_field ORDER BY section_seq, sort_order")
+    ed = st.data_editor(
+        df, disabled=["field_code", "section", "input_type"], use_container_width=True, hide_index=True,
+        column_config={"is_required": st.column_config.CheckboxColumn("필수"),
+                       "is_active": st.column_config.CheckboxColumn("사용"),
+                       "infer_note": "미입력 시 유추 방법(운영자용)"},
+        key="ifield_editor",
+    )
+    if st.button("저장", key="ifield_save"):
+        n = 0
+        for o, r in zip(df.itertuples(), ed.itertuples()):
+            if (o.label, o.is_required, o.is_active, o.sort_order, o.help_text, o.infer_note) != \
+                    (r.label, r.is_required, r.is_active, r.sort_order, r.help_text, r.infer_note):
+                run_write("UPDATE intake_field SET label=%s, is_required=%s, is_active=%s, sort_order=%s, "
+                          "help_text=%s, infer_note=%s WHERE field_code=%s",
+                          (r.label, bool(r.is_required), bool(r.is_active), int(r.sort_order),
+                           r.help_text if pd.notna(r.help_text) else None,
+                           r.infer_note if pd.notna(r.infer_note) else None, o.field_code))
+                n += 1
+        st.success(f"{n}개 항목 변경")
+
+
+def render_hub_intake_page():
+    st.header("신청 접수")
+    t1, t2 = st.tabs(["접수함", "입력 항목 마스터"])
+    with t1:
+        reqs = run_query(
+            "SELECT r.intake_id, c.company_name, r.stage, r.created_at, r.submitted_at, r.customer_reviewed_at, "
+            "a.project_no, (SELECT COUNT(*) FROM intake_value v WHERE v.intake_id=r.intake_id "
+            "AND v.source='operator_inferred') AS 운영자추정, (SELECT COUNT(*) FROM intake_value v "
+            "WHERE v.intake_id=r.intake_id AND v.confirm_status IN ('pending','corrected')) AS 확인대기_수정 "
+            "FROM intake_request r JOIN company c USING (company_id) "
+            "LEFT JOIN application a ON a.application_id = r.application_id ORDER BY r.intake_id DESC"
+        )
+        if reqs.empty:
+            st.info("접수된 신청이 없습니다. 고객은 브랜치 앱 [📝 신청 정보]에서 신청합니다.")
+        else:
+            show = reqs.copy()
+            show["단계"] = show["stage"].map(intake_core.STAGE_LABEL)
+            st.dataframe(show.drop(columns=["stage"]), use_container_width=True, hide_index=True)
+            labels = {int(r.intake_id): f"#{r.intake_id} {r.company_name} · {intake_core.STAGE_LABEL[r.stage]}"
+                      for r in reqs.itertuples()}
+            _render_intake_detail(_pick("신청", labels, "ihub_pick"))
+    with t2:
+        _render_intake_field_master()
+
+
 # ---------- 사이드바 네비게이션 ----------
 
 st.sidebar.title("경영시스템문서 플랫폼")
+st.sidebar.caption("허브 앱 (운영자용)")
 page = st.sidebar.radio(
     "화면 선택",
-    ["1. 기준정보 조회", "2. 사용자 관리", "3. 문서관리"],
+    ["1. 기준정보 조회", "2. 사용자 관리", "3. 문서관리",
+     "4. 고객·발행 관리", "5. 양식 실적 기록", "6. 템플릿 관리", "7. 신청 접수"],
 )
 
 try:
@@ -1083,6 +2119,11 @@ if page.startswith("1"):
         st.caption(
             "std_code 대소문자로 개정판을 구분합니다(예: q=2015년판, Q=2026년판). "
             "삭제는 지원하지 않습니다 — 더 이상 신규 등록에 쓰지 않으려면 '사용 안 함(is_active=false)'으로 바꾸세요."
+        )
+        st.caption(
+            "prefix=문서코드 접두글자 · valid_from/until=유효기간(시작일/만료일) · "
+            "is_current_default=등록폼 기본추천 · sort_order=조합코드 생성순서(작을수록 앞) · "
+            "is_active=신규등록 노출여부"
         )
 
         st.divider()
@@ -2767,3 +3808,22 @@ elif page.startswith("3"):
                         key="classify_form_pick",
                     )
                     _render_ledger(form_choice[0], is_form=True)
+
+
+# ---------- 4~6. 허브 확장 화면 ----------
+
+elif page.startswith("7"):
+    if not _intake_schema_ready():
+        st.error("신청 접수용 테이블이 없습니다. 먼저 `python scripts/14_migrate_intake.py`를 실행하세요(12, 13번 이후).")
+    else:
+        render_hub_intake_page()
+
+elif page[0] in "456":
+    if not _hub_schema_ready():
+        st.error("허브/브랜치용 테이블이 없습니다. 먼저 `python scripts/12_migrate_hub_branch.py`를 실행하세요.")
+    elif page.startswith("4"):
+        render_hub_customer_page()
+    elif page.startswith("5"):
+        render_hub_record_page()
+    else:
+        render_hub_template_page()
