@@ -4,6 +4,9 @@
 허브 앱(app.py, 운영자용)과 같은 DB·GCS를 쓴다. 설계: claude/hub_branch_design.md
 
 로그인 전:  🔐 로그인 / 🔑 다운로드 키로 문서 받기(단순 사용자·로컬 브랜치용, 로그인 불필요)
+로그인 대상(2026-10-30, 15번): 브랜치·로컬 브랜치·단순 사용자 회사 계정 + 무료 개인 회원(role=member).
+  단순·무료 회원 메뉴: 👤 내 정보(이메일) / 📥 다운로드 키로 문서 받기 / 🔑 비밀번호 변경
+  (커뮤니티 SSO는 v_member_sso 뷰를 읽어 연동 예정)
 로그인 후(고객 유형별):
   공통           — 📝 신청 정보(신청 시 일괄 입력·제출, 확인 요청 응답, 만들어진 문서 확인) — 신청건이 없어도 사용
   ② 브랜치       — 📘 내 문서함(공유·개정, 충돌 방지) / 📁 파일 보관함 / ✍ 기록 입력(서버 저장) /
@@ -46,7 +49,10 @@ st.set_page_config(page_title="경영시스템문서 — 고객 포털", layout=
 CATEGORY_KO = {"manual": "매뉴얼", "procedure": "절차서", "form": "양식", "guideline": "지침서"}
 AUTHOR_KO = {"operator": "운영사", "customer": "고객"}
 EVIDENCE_TYPE_LABEL = {"erp": "ERP/정보시스템", "paper": "종이 보관", "file": "파일/공유폴더", "external": "외부기관"}
-ROLE_KO = {"customer_admin": "고객 관리자", "customer_user": "고객 사용자"}
+ROLE_KO = {"customer_admin": "고객 관리자", "customer_user": "고객 사용자", "member": "개인 회원"}
+TIER_KO = {"branch": "② 브랜치 서비스", "local_branch": "③ 로컬 브랜치 서비스(기록은 내 PC에 저장)",
+           "simple": "① 단순 사용자(문서는 다운로드 키로 받음)", "free": "무료 일반 회원"}
+BASIC_MENU = ["👤 내 정보", "📥 다운로드 키로 문서 받기", "🔑 비밀번호 변경"]   # 단순·무료 회원
 
 
 # ---------------------------------------------------------------------------
@@ -126,11 +132,12 @@ def _login(login_id, password):
     df = q(
         """
         SELECT u.user_id, u.company_id, u.role, u.login_id, u.display_name, u.password_hash,
-               u.is_active, u.must_change_password, c.company_name, ca.customer_type, ca.is_active AS acct_active
+               u.is_active, u.must_change_password, c.company_name,
+               COALESCE(ca.customer_type, u.member_tier) AS customer_type, ca.is_active AS acct_active
         FROM app_user u
-        JOIN company c ON c.company_id = u.company_id
+        LEFT JOIN company c ON c.company_id = u.company_id
         LEFT JOIN customer_account ca ON ca.company_id = u.company_id
-        WHERE u.login_id = %s AND u.role IN ('customer_admin','customer_user')
+        WHERE u.login_id = %s AND u.role IN ('customer_admin','customer_user','member')
         """,
         (login_id.strip(),),
     )
@@ -142,13 +149,14 @@ def _login(login_id, password):
     r = df.iloc[0]
     if not r["is_active"] or (pd.notna(r["acct_active"]) and not r["acct_active"]):
         return None, "사용이 중지된 계정입니다. 관리자에게 문의하세요."
-    if r["customer_type"] not in ("branch", "local_branch"):
-        return None, "이 회사는 브랜치 서비스 대상이 아닙니다. 받으신 다운로드 키로 문서를 받으세요."
+    if r["customer_type"] not in TIER_KO:
+        return None, "회원 등급이 지정되지 않은 계정입니다. 운영사에 문의하세요."
     x("UPDATE app_user SET last_login_at=now(), failed_login_count=0 WHERE user_id=%s", (int(r["user_id"]),))
     return {
-        "user_id": int(r["user_id"]), "company_id": int(r["company_id"]), "role": r["role"],
-        "login_id": r["login_id"], "name": r["display_name"] or r["login_id"],
-        "company_name": r["company_name"], "customer_type": r["customer_type"],
+        "user_id": int(r["user_id"]), "company_id": int(r["company_id"]) if pd.notna(r["company_id"]) else None,
+        "role": r["role"], "login_id": r["login_id"], "name": r["display_name"] or r["login_id"],
+        "company_name": r["company_name"] if pd.notna(r["company_name"]) else "개인 회원",
+        "customer_type": r["customer_type"],
         "must_change_password": bool(r["must_change_password"]),
     }, None
 
@@ -722,24 +730,33 @@ def page_users(ctx):
     if not _require_admin():
         return
     cid = _user()["company_id"]
-    users = q("SELECT user_id, login_id AS 아이디, display_name AS 이름, role, is_active AS 사용, last_login_at AS 최근로그인 "
+    users = q("SELECT user_id, login_id AS 아이디, display_name AS 이름, email AS 이메일, role, is_active AS 사용, "
+              "last_login_at AS 최근로그인 "
               "FROM app_user WHERE company_id=%s ORDER BY user_id", (cid,))
     show = users.copy()
     show["권한"] = show["role"].map(ROLE_KO)
     st.dataframe(show.drop(columns=["role"]), use_container_width=True, hide_index=True)
 
     st.subheader("사용자 추가")
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     lid = c1.text_input("아이디", key="usr_new_id")
     name = c2.text_input("이름", key="usr_new_name")
-    role = c3.selectbox("권한", list(ROLE_KO), index=1, format_func=lambda r: ROLE_KO[r], key="usr_new_role")
+    email = c3.text_input("이메일", key="usr_new_email")
+    roles = ["customer_admin", "customer_user"]
+    role = c4.selectbox("권한", roles, index=1, format_func=lambda r: ROLE_KO[r], key="usr_new_role")
     if st.button("추가", key="usr_add", disabled=not lid.strip()):
+        e = email.strip()
         if not q("SELECT 1 FROM app_user WHERE login_id=%s", (lid.strip(),)).empty:
             st.error("이미 사용 중인 아이디입니다.")
+        elif auth_utils.email_problem(e):
+            st.error(auth_utils.email_problem(e))
+        elif e and not q("SELECT 1 FROM app_user WHERE lower(email)=lower(%s)", (e,)).empty:
+            st.error("이미 다른 계정에서 쓰는 이메일입니다.")
         else:
             pw = auth_utils.temp_password()
-            x("INSERT INTO app_user (company_id, role, login_id, display_name, password_hash, must_change_password) "
-              "VALUES (%s,%s,%s,NULLIF(%s,''),%s,true)", (cid, role, lid.strip(), name.strip(), auth_utils.hash_password(pw)))
+            x("INSERT INTO app_user (company_id, role, login_id, display_name, email, password_hash, must_change_password) "
+              "VALUES (%s,%s,%s,NULLIF(%s,''),NULLIF(%s,''),%s,true)",
+              (cid, role, lid.strip(), name.strip(), e, auth_utils.hash_password(pw)))
             st.session_state["usr_temp_pw"] = (lid.strip(), pw)
     if "usr_temp_pw" in st.session_state:
         who, pw = st.session_state["usr_temp_pw"]
@@ -762,6 +779,34 @@ def page_users(ctx):
           (auth_utils.hash_password(pw), uid, cid))
         st.session_state["usr_temp_pw"] = (str(others[others["user_id"] == uid].iloc[0]["아이디"]), pw)
         st.rerun()
+
+
+def page_profile(ctx=None):
+    st.header("👤 내 정보")
+    u = _user()
+    me = q("SELECT login_id, display_name, email, email_verified FROM app_user WHERE user_id=%s", (u["user_id"],)).iloc[0]
+    st.markdown(f"아이디: **{me['login_id']}** · 등급: **{TIER_KO[u['customer_type']]}** · 권한: {ROLE_KO[u['role']]}")
+    name = st.text_input("이름", value=me["display_name"] if pd.notna(me["display_name"]) else "", key="prof_name")
+    email = st.text_input("이메일(알림·커뮤니티 로그인에 사용)", value=me["email"] if pd.notna(me["email"]) else "",
+                          key="prof_email")
+    if pd.notna(me["email"]):
+        st.caption("✅ 확인된 이메일" if me["email_verified"] else "⏳ 아직 확인되지 않은 이메일(운영사 확인 후 커뮤니티 사용 가능)")
+    if st.button("저장", type="primary", key="prof_save"):
+        e = email.strip()
+        problem = auth_utils.email_problem(e)
+        if problem:
+            st.error(problem)
+        elif e and not q("SELECT 1 FROM app_user WHERE lower(email)=lower(%s) AND user_id<>%s", (e, u["user_id"])).empty:
+            st.error("이미 다른 계정에서 쓰는 이메일입니다.")
+        else:
+            changed = (e or None) != (me["email"] if pd.notna(me["email"]) else None)
+            x("UPDATE app_user SET display_name=NULLIF(%s,''), email=NULLIF(%s,''), "
+              "email_verified = CASE WHEN %s THEN false ELSE email_verified END WHERE user_id=%s",
+              (name.strip(), e, changed, u["user_id"]))
+            u["name"] = name.strip() or u["login_id"]
+            st.success("저장했습니다." + (" 이메일이 바뀌어 다시 확인이 필요합니다." if changed and e else ""))
+            st.rerun()
+    st.caption("커뮤니티에서는 회사명 대신 이름(또는 아이디)과 업종만 표시됩니다.")
 
 
 def page_password(forced=False):
@@ -1038,12 +1083,14 @@ def _render_intake_readonly(intake_id, stage, fields, vals, values, files):
 # ---------------------------------------------------------------------------
 MENUS = {
     "branch": ["📝 신청 정보", "📘 내 문서함", "📁 파일 보관함", "✍ 기록 입력", "📊 기록 대장", "📋 기록 작성 예시",
-               "🔒 공개 설정", "🕵 운영자 접근", "👥 사용자 관리", "🔑 비밀번호 변경"],
+               "🔒 공개 설정", "🕵 운영자 접근", "👥 사용자 관리", "👤 내 정보", "🔑 비밀번호 변경"],
     "local_branch": ["📝 신청 정보", "✍ 기록 입력", "📋 기록 작성 예시", "🔒 공개 설정", "👥 사용자 관리",
-                     "🔑 비밀번호 변경"],
+                     "👤 내 정보", "🔑 비밀번호 변경"],
 }
 PAGES = {
     "📝 신청 정보": page_intake,
+    "👤 내 정보": page_profile,
+    "📥 다운로드 키로 문서 받기": lambda ctx: (st.header("📥 다운로드 키로 문서 받기"), page_download_key()),
     "📘 내 문서함": page_documents, "📁 파일 보관함": page_files, "✍ 기록 입력": page_record_entry,
     "📊 기록 대장": page_ledger, "📋 기록 작성 예시": page_templates, "🔒 공개 설정": page_disclosure,
     "🕵 운영자 접근": page_operator_access, "👥 사용자 관리": page_users,
@@ -1056,8 +1103,8 @@ def main():
     except Exception as e:  # noqa: BLE001
         st.error(f"DB 연결 실패: {e}")
         st.stop()
-    if not bool(q("SELECT to_regclass('public.intake_request') IS NOT NULL AS ok").iloc[0]["ok"]):
-        st.error("브랜치용 테이블이 없습니다. scripts의 12, 13, 14번 마이그레이션을 먼저 실행하세요.")
+    if not bool(q("SELECT to_regclass('public.v_member_sso') IS NOT NULL AS ok").iloc[0]["ok"]):
+        st.error("브랜치용 테이블이 없습니다. scripts의 12, 13, 14, 15번 마이그레이션을 먼저 실행하세요.")
         st.stop()
 
     u = _user()
@@ -1067,8 +1114,7 @@ def main():
 
     st.sidebar.title("고객 포털")
     st.sidebar.markdown(f"**{u['company_name']}**  \n{u['name']} · {ROLE_KO[u['role']]}")
-    st.sidebar.caption({"branch": "② 브랜치 서비스", "local_branch": "③ 로컬 브랜치 서비스(기록은 내 PC에 저장)"}
-                       [u["customer_type"]])
+    st.sidebar.caption(TIER_KO[u["customer_type"]])
     if st.sidebar.button("로그아웃", key="logout"):
         st.session_state.clear()
         st.rerun()
@@ -1076,10 +1122,18 @@ def main():
         page_password(forced=True)
         return
 
+    if u["customer_type"] in ("simple", "free"):
+        choice = st.sidebar.radio("메뉴", BASIC_MENU, key="nav")
+        if choice == "🔑 비밀번호 변경":
+            page_password()
+        else:
+            PAGES[choice](None)
+        return
+
     apps = _my_apps()
     if apps.empty:
         # 신청건이 아직 없으면(처음 신청하는 고객) 신청 정보 입력부터
-        menu = ["📝 신청 정보", "👥 사용자 관리", "🔑 비밀번호 변경"]
+        menu = ["📝 신청 정보", "👥 사용자 관리", "👤 내 정보", "🔑 비밀번호 변경"]
         choice = st.sidebar.radio("메뉴", menu, key="nav")
         if choice == "🔑 비밀번호 변경":
             page_password()

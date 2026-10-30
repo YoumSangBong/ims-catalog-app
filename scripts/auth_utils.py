@@ -51,3 +51,12 @@ def temp_password() -> str:
 def key_hash(key_text: str) -> str:
     """다운로드 키 해시(허브 발급 시 DB의 encode(sha256(...),'hex')와 동일). 공백·대소문자 그대로."""
     return hashlib.sha256(key_text.strip().encode("utf-8")).hexdigest()
+
+
+def email_problem(email: str) -> str | None:
+    """이메일 형식 확인(없으면 None). 빈 값은 호출하는 쪽에서 필수 여부 판단."""
+    import re
+    e = (email or "").strip()
+    if e and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", e):
+        return "이메일 형식이 올바르지 않습니다."
+    return None

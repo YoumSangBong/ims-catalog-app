@@ -1078,6 +1078,14 @@ def _app_labels():
     return {int(i): lbl for i, lbl in _app_options_all()}
 
 
+def _member_schema_ready():
+    """15번(회원·SSO 준비) 적용 여부."""
+    try:
+        return bool(run_query("SELECT to_regclass('public.v_member_sso') IS NOT NULL AS ok").iloc[0]["ok"])
+    except Exception:
+        return False
+
+
 def _hub_schema_ready():
     try:
         return bool(run_query("SELECT to_regclass('public.form_record') IS NOT NULL AS ok").iloc[0]["ok"])
@@ -1203,6 +1211,10 @@ def _render_customer_type_tab():
         ORDER BY c.company_id
         """
     )
+    member_ready = _member_schema_ready()
+    if member_ready:
+        sec = run_query("SELECT company_id, sector_main FROM company")
+        companies = companies.merge(sec, on="company_id", how="left")
     with st.expander("➕ 신규 고객(회사) 등록 — 신청건 없이 먼저 계정을 주고 고객이 직접 신청 정보를 입력하게 할 때"):
         c1, c2, c3 = st.columns(3)
         nc_name = c1.text_input("회사명", key="newco_name")
@@ -1223,8 +1235,9 @@ def _render_customer_type_tab():
         return
     view = companies.copy()
     view["고객 유형"] = view["customer_type"].map(CUSTOMER_TYPE_LABEL).fillna("미지정")
-    st.dataframe(view[["company_id", "company_name", "biz_reg_no", "고객 유형", "terms_version",
-                       "terms_accepted_at", "신청건수"]], use_container_width=True, hide_index=True)
+    cols = ["company_id", "company_name", "biz_reg_no", "고객 유형"] + (["sector_main"] if member_ready else []) \
+        + ["terms_version", "terms_accepted_at", "신청건수"]
+    st.dataframe(view[cols].rename(columns={"sector_main": "대표 업종"}), use_container_width=True, hide_index=True)
 
     st.markdown("**고객 유형 지정/변경**")
     co_labels = {int(r.company_id): f"{r.company_id} - {r.company_name}" for r in companies.itertuples()}
@@ -1239,7 +1252,17 @@ def _render_customer_type_tab():
     terms = st.text_input("동의한 약관 버전(공개·익명화·검수 조항 포함)",
                           value=cur_row["terms_version"] if pd.notna(cur_row["terms_version"]) else "",
                           key=f"cust_type_terms_{co_id}")
+    sector_pick = None
+    if member_ready:
+        smap = {"": "(미지정 — 신청건이 생기면 자동)"}
+        smap.update({r.code: f"{r.code} — {r.name}" for r in run_query("SELECT code, name FROM sector_main ORDER BY code").itertuples()})
+        cur_sec = cur_row["sector_main"] if pd.notna(cur_row.get("sector_main")) else ""
+        sector_pick = st.selectbox("대표 업종(IAF 대분류 — 커뮤니티 업종 채널 배정에 사용)", list(smap),
+                                   index=list(smap).index(cur_sec) if cur_sec in smap else 0,
+                                   format_func=lambda c: smap[c], key=f"cust_sector_{co_id}")
     if st.button("저장", key="cust_type_save"):
+        if member_ready:
+            run_write("UPDATE company SET sector_main=NULLIF(%s,'') WHERE company_id=%s", (sector_pick or "", co_id))
         run_write(
             """
             INSERT INTO customer_account (company_id, customer_type, terms_version, terms_accepted_at)
@@ -1725,9 +1748,20 @@ def _render_operator_example():
         st.rerun()
 
 
+def _account_problem(login_id, email):
+    if len(run_query("SELECT 1 FROM app_user WHERE login_id=%s", (login_id.strip(),))):
+        return "이미 사용 중인 아이디입니다."
+    e = email.strip()
+    if auth_utils.email_problem(e):
+        return auth_utils.email_problem(e)
+    if e and len(run_query("SELECT 1 FROM app_user WHERE lower(email)=lower(%s)", (e,))):
+        return "이미 다른 계정에서 쓰는 이메일입니다."
+    return None
+
+
 def _render_branch_account_tab():
     st.caption(
-        "브랜치·로컬 브랜치 고객의 첫 **고객 관리자** 계정을 발급합니다. 이후 직원 계정은 고객 관리자가 "
+        "브랜치·로컬 브랜치·단순 사용자 고객의 첫 **고객 관리자** 계정을 발급합니다. 이후 직원 계정은 고객 관리자가 "
         "브랜치 앱(👥 사용자 관리)에서 직접 만듭니다. 임시 비밀번호는 첫 로그인 때 변경이 강제됩니다."
     )
     if not bool(run_query("SELECT to_regclass('public.customer_file') IS NOT NULL AS ok").iloc[0]["ok"]):
@@ -1736,33 +1770,43 @@ def _render_branch_account_tab():
     cos = run_query(
         "SELECT c.company_id, c.company_name, ca.customer_type FROM company c "
         "JOIN customer_account ca ON ca.company_id = c.company_id "
-        "WHERE ca.customer_type IN ('branch','local_branch') ORDER BY c.company_id"
+        "WHERE ca.customer_type IN ('branch','local_branch','simple') ORDER BY c.company_id"
     )
+    if not _member_schema_ready():
+        st.error("먼저 `python scripts/15_migrate_member_sso.py`를 실행하세요(이메일·회원 등급).")
+        return
     if cos.empty:
-        st.info("브랜치/로컬 브랜치로 지정된 회사가 없습니다. [고객 유형] 탭에서 먼저 지정하세요.")
+        st.info("고객 유형이 지정된 회사가 없습니다. [고객 유형] 탭에서 먼저 지정하세요.")
     else:
         co_id = _pick("회사", {int(r.company_id): f"{r.company_id} - {r.company_name} "
                                                  f"({CUSTOMER_TYPE_LABEL[r.customer_type]})" for r in cos.itertuples()},
                       "bacct_co")
-        users = run_query("SELECT user_id, login_id, display_name, role, is_active, must_change_password, "
-                          "last_login_at FROM app_user WHERE company_id=%s ORDER BY user_id", (co_id,))
+        users = run_query("SELECT user_id, login_id, display_name, email, email_verified, role, is_active, "
+                          "must_change_password, last_login_at FROM app_user WHERE company_id=%s ORDER BY user_id", (co_id,))
         st.dataframe(users, use_container_width=True, hide_index=True)
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
         lid = c1.text_input("고객 관리자 아이디", key=f"bacct_id_{co_id}")
         name = c2.text_input("이름", key=f"bacct_name_{co_id}")
+        email = c3.text_input("이메일", key=f"bacct_email_{co_id}")
         if st.button("계정 발급", key="bacct_create", disabled=not lid.strip()):
-            if len(run_query("SELECT 1 FROM app_user WHERE login_id=%s", (lid.strip(),))):
-                st.error("이미 사용 중인 아이디입니다.")
+            err = _account_problem(lid, email)
+            if err:
+                st.error(err)
             else:
                 pw = auth_utils.temp_password()
                 run_write(
-                    "INSERT INTO app_user (company_id, role, login_id, display_name, password_hash, must_change_password) "
-                    "VALUES (%s,'customer_admin',%s,NULLIF(%s,''),%s,true)",
-                    (co_id, lid.strip(), name.strip(), auth_utils.hash_password(pw)),
+                    "INSERT INTO app_user (company_id, role, login_id, display_name, email, password_hash, "
+                    "must_change_password) VALUES (%s,'customer_admin',%s,NULLIF(%s,''),NULLIF(%s,''),%s,true)",
+                    (co_id, lid.strip(), name.strip(), email.strip(), auth_utils.hash_password(pw)),
                 )
                 st.session_state["bacct_pw"] = (lid.strip(), pw)
         if len(users):
             uid = _pick("비밀번호 초기화 대상", {int(r.user_id): r.login_id for r in users.itertuples()}, "bacct_reset_pick")
+            ver = bool(users.set_index("user_id").loc[uid, "email_verified"])
+            has_email = pd.notna(users.set_index("user_id").loc[uid, "email"])
+            if has_email and st.button("이메일 확인 취소" if ver else "이메일 확인 처리(본인 확인 완료)", key="bacct_verify"):
+                run_write("UPDATE app_user SET email_verified = NOT email_verified WHERE user_id=%s", (uid,))
+                st.rerun()
             if st.button("임시 비밀번호로 초기화", key="bacct_reset"):
                 pw = auth_utils.temp_password()
                 run_write("UPDATE app_user SET password_hash=%s, must_change_password=true, is_active=true "
@@ -1775,6 +1819,30 @@ def _render_branch_account_tab():
             if st.button("확인했습니다(숨기기)", key="bacct_hide"):
                 del st.session_state["bacct_pw"]
                 st.rerun()
+
+    st.divider()
+    with st.expander("👤 개인(무료 일반) 회원 계정 발급 — 회사 없이 커뮤니티에만 참여하는 회원"):
+        c1, c2, c3 = st.columns(3)
+        m_id = c1.text_input("아이디", key="macct_id")
+        m_name = c2.text_input("이름", key="macct_name")
+        m_email = c3.text_input("이메일(필수)", key="macct_email")
+        if st.button("개인 회원 발급", key="macct_create", disabled=not (m_id.strip() and m_email.strip())):
+            err = _account_problem(m_id, m_email)
+            if err:
+                st.error(err)
+            else:
+                pw = auth_utils.temp_password()
+                run_write("INSERT INTO app_user (role, member_tier, login_id, display_name, email, password_hash, "
+                          "must_change_password) VALUES ('member','free',%s,NULLIF(%s,''),%s,%s,true)",
+                          (m_id.strip(), m_name.strip(), m_email.strip(), auth_utils.hash_password(pw)))
+                st.success(f"{m_id.strip()} 임시 비밀번호 — 지금 한 번만 표시됩니다.")
+                st.code(pw)
+        members = run_query("SELECT user_id, login_id, display_name, email, email_verified, member_tier, is_active, "
+                            "last_login_at FROM app_user WHERE role='member' ORDER BY user_id")
+        if len(members):
+            st.dataframe(members, use_container_width=True, hide_index=True)
+    st.markdown("**SSO 연동 대상 미리보기**(v_member_sso — 커뮤니티에는 회사명 없이 업종만 전달)")
+    st.dataframe(run_query("SELECT * FROM v_member_sso ORDER BY external_id"), use_container_width=True, hide_index=True)
 
     st.divider()
     st.markdown("**최근 고객이 개정한 문서** (브랜치 앱에서 개정 → 이 허브에도 같은 행으로 반영됨)")
