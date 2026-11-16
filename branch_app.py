@@ -43,8 +43,10 @@ import auth_utils  # noqa: E402
 import gcs_storage  # noqa: E402
 import intake_core as ic  # noqa: E402
 import record_utils  # noqa: E402
+import joydocs_ui as ui  # noqa: E402
 
-st.set_page_config(page_title="경영시스템문서 — 고객 포털", layout="wide")
+st.set_page_config(page_title="JoyDocs 고객 포털", page_icon=str(ui.BRAND_DIR / "joydocs_symbol.svg"), layout="wide")
+ui.apply_theme()
 
 CATEGORY_KO = {"manual": "매뉴얼", "procedure": "절차서", "form": "양식", "guideline": "지침서"}
 AUTHOR_KO = {"operator": "운영사", "customer": "고객"}
@@ -191,21 +193,34 @@ def _app_ctx(app_id):
 # 로그인 전 화면
 # ---------------------------------------------------------------------------
 def page_login():
-    st.title("경영시스템문서 고객 포털")
-    t1, t2 = st.tabs(["🔐 로그인", "🔑 다운로드 키로 문서 받기"])
-    with t1:
-        lid = st.text_input("아이디", key="login_id")
-        pw = st.text_input("비밀번호", type="password", key="login_pw")
-        if st.button("로그인", type="primary", key="login_btn"):
-            user, err = _login(lid, pw)
-            if err:
-                st.error(err)
-            else:
-                st.session_state["user"] = user
-                st.rerun()
-        st.caption("계정은 운영사가 발급합니다. 비밀번호를 잊으셨으면 회사 관리자 또는 운영사에 초기화를 요청하세요.")
-    with t2:
-        page_download_key()
+    # (2026-11-15) JoyDocs 디자인 적용 — 왼쪽 소개(설명 문구 포함 로고), 오른쪽 로그인 카드 +
+    # 다운로드 키(계정 없이 문서 받기)는 카드 아래 펼침 메뉴로.
+    ui.apply_login_theme()
+    left, right = st.columns([1.15, 1], gap="large")
+    with left:
+        ui.login_hero("© JoyDocs · [회사명]")
+    with right:
+        _, mid, _ = st.columns([1, 6, 1])
+        with mid:
+            ui.login_symbol()
+            with st.container(border=True):
+                ui.login_title()
+                with st.form("login_form", border=False):
+                    lid = st.text_input("아이디", key="login_id")
+                    pw = st.text_input("비밀번호", type="password", key="login_pw")
+                    submitted = st.form_submit_button("로그인", type="primary", width="stretch")
+                if submitted:
+                    user, err = _login(lid, pw)
+                    if err:
+                        st.error(err)
+                    else:
+                        st.session_state["user"] = user
+                        st.rerun()
+                st.caption("계정은 운영사가 발급합니다. 비밀번호를 잊으셨으면 회사 관리자 또는 운영사에 "
+                           "초기화를 요청하세요.")
+            with st.expander("**다운로드 키로 문서 받기** — 계정 없이 발급받은 키로 문서를 받습니다",
+                             icon=":material/key:"):
+                page_download_key()
 
 
 def page_download_key():
@@ -1112,7 +1127,7 @@ def main():
         page_login()
         return
 
-    st.sidebar.title("고객 포털")
+    ui.sidebar_brand("고객 포털")
     st.sidebar.markdown(f"**{u['company_name']}**  \n{u['name']} · {ROLE_KO[u['role']]}")
     st.sidebar.caption(TIER_KO[u["customer_type"]])
     if st.sidebar.button("로그아웃", key="logout"):

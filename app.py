@@ -54,8 +54,10 @@ import hwp_split  # noqa: E402
 import record_utils  # noqa: E402
 import auth_utils  # noqa: E402
 import intake_core  # noqa: E402
+import joydocs_ui as ui  # noqa: E402
 
-st.set_page_config(page_title="경영시스템문서 플랫폼 — 허브", layout="wide")
+st.set_page_config(page_title="JoyDocs 허브", page_icon=str(ui.BRAND_DIR / "joydocs_symbol.svg"), layout="wide")
+ui.apply_theme()
 
 # 규격 선택 (2026-09-18부터: 하드코딩된 7개 조합 대신 standard 테이블에서 동적으로
 # 읽어와 다중선택하는 방식으로 전환 — 규격이 늘어나거나 개정판(예: ISO 9001/14001
@@ -1861,7 +1863,7 @@ def _render_branch_account_tab():
 
 
 def render_hub_customer_page():
-    st.header("고객·발행 관리")
+    ui.page_header("고객·발행 관리", "고객 운영")
     t1, t2, t3, t4 = st.tabs(["고객 유형", "브랜치 계정", "문서 발행·다운로드 키", "양식 마스터(개인정보·기본 증빙)"])
     with t1:
         _render_customer_type_tab()
@@ -1874,7 +1876,7 @@ def render_hub_customer_page():
 
 
 def render_hub_record_page():
-    st.header("양식 실적 기록")
+    ui.page_header("양식 실적 기록", "기록 · 설정")
     apps = _app_labels()
     if not apps:
         st.info("신청건이 없습니다.")
@@ -1898,7 +1900,7 @@ def render_hub_record_page():
 
 
 def render_hub_template_page():
-    st.header("템플릿 관리")
+    ui.page_header("템플릿 관리", "기준정보")
     t1, t2, t3 = st.tabs(["접수·검수", "운영자 예시 등록", "공개 현황·설정"])
     with t1:
         _render_template_review()
@@ -2125,7 +2127,7 @@ def _render_intake_field_master():
 
 
 def render_hub_intake_page():
-    st.header("신청 접수")
+    ui.page_header("신청 접수", "고객 운영")
     t1, t2 = st.tabs(["접수함", "입력 항목 마스터"])
     with t1:
         reqs = run_query(
@@ -2151,33 +2153,67 @@ def render_hub_intake_page():
 
 # ---------- 사이드바 네비게이션 ----------
 
-st.sidebar.title("경영시스템문서 플랫폼")
-st.sidebar.caption("허브 앱 (운영자용)")
-page = st.sidebar.radio(
-    "화면 선택",
-    ["1. 기준정보 조회", "2. 사용자 관리", "3. 문서관리",
-     "4. 고객·발행 관리", "5. 양식 실적 기록", "6. 템플릿 관리", "7. 신청 접수"],
-)
+# (2026-11-15) JoyDocs 디자인 적용 — 대표 로고 + 그룹으로 묶은 메뉴. 메뉴 값("1. 기준정보 조회" 등)은
+# 그대로 두어 아래 page.startswith("1") 분기는 바꾸지 않았다. 표시 순서만 디자인의 그룹대로 정렬.
+ui.sidebar_brand("허브 · 운영자")
 
 try:
     _engine_conn()
-    st.sidebar.success("DB 연결됨")
+    _db_ok, _db_err = True, ""
 except Exception as e:
-    st.sidebar.error(f"DB 연결 실패: {e}")
+    _db_ok, _db_err = False, str(e)
+
+
+def _waiting_intakes() -> int:
+    """제출되어 운영자 확인을 기다리는 신청 수(메뉴 옆 숫자)."""
+    if not _db_ok:
+        return 0
+    try:
+        return int(run_query("SELECT COUNT(*) AS n FROM intake_request WHERE stage = 'submitted'").iloc[0]["n"])
+    except Exception:
+        return 0
+
+
+_n_wait = _waiting_intakes()
+HUB_NAV = [
+    ("기준정보", [
+        ("1. 기준정보 조회", "기준정보 조회", ":material/database:"),
+        ("6. 템플릿 관리", "템플릿 관리", ":material/grid_view:"),
+    ]),
+    ("고객 운영", [
+        ("7. 신청 접수", "신청 접수" + (f"  :red-badge[{_n_wait}]" if _n_wait else ""), ":material/inbox:"),
+        ("4. 고객·발행 관리", "고객·발행 관리", ":material/apartment:"),
+        ("3. 문서관리", "문서관리", ":material/folder:"),
+    ]),
+    ("기록 · 설정", [
+        ("5. 양식 실적 기록", "양식 실적 기록", ":material/edit_note:"),
+        ("2. 사용자 관리", "사용자 관리", ":material/group:"),
+    ]),
+]
+page = ui.sidebar_nav(HUB_NAV, key="hub_page", default="1. 기준정보 조회")
+ui.sidebar_status(_db_ok, "DB 연결됨" if _db_ok else "DB 연결 실패", "운영자")
+
+if not _db_ok:
+    st.error(f"DB 연결 실패: {_db_err}")
     st.stop()
 
 
 # ---------- 1. 기준정보 조회 ----------
 
 if page.startswith("1"):
-    st.header("기준정보 조회")
+    ui.page_header("기준정보 조회", "기준정보")
 
-    tab = st.selectbox(
-        "테이블 선택",
-        ["standard (규격)", "sector_main (대분류)", "iaf_group (IAF그룹)",
-         "sector_profile (업종 프로필)", "doc_type (문서종류 마스터)", "form_pattern (양식 패턴)",
-         "sample_original (Original 현황)"],
-    )
+    _ref_tabs = ["standard (규격)", "sector_main (대분류)", "iaf_group (IAF그룹)",
+                 "sector_profile (업종 프로필)", "doc_type (문서종류 마스터)", "form_pattern (양식 패턴)",
+                 "sample_original (Original 현황)"]
+    _ref_short = {"standard": "규격", "sector_main": "대분류", "iaf_group": "IAF 그룹",
+                  "sector_profile": "업종 프로필", "doc_type": "문서종류", "form_pattern": "양식 패턴",
+                  "sample_original": "Original 현황"}
+    # (2026-11-15) 드롭다운 대신 알약 모양 탭 버튼. 값은 그대로라 아래 tab.startswith(...) 분기는 동일.
+    tab = st.segmented_control(
+        "테이블 선택", _ref_tabs, default=_ref_tabs[0], key="ref_tab", label_visibility="collapsed",
+        format_func=lambda t: _ref_short[t.split(" ")[0]],
+    ) or _ref_tabs[0]
 
     if tab.startswith("standard"):
         st.dataframe(
@@ -2583,7 +2619,7 @@ if page.startswith("1"):
 # ---------- 2. 사용자 관리 ----------
 
 elif page.startswith("2"):
-    st.header("사용자 관리")
+    ui.page_header("사용자 관리", "기록 · 설정")
     st.caption(
         "회사·신청건을 '사용자 등록' 하나로 통합(실제 회사/샘플 양자택일 지원). "
         "조직도는 신청건별 전용으로 관리하며 '조직 책임과 권한' 화면에서 부서 목록/책임과 권한/"
@@ -3254,7 +3290,7 @@ elif page.startswith("2"):
 # ---------- 3. 문서관리 ----------
 
 elif page.startswith("3"):
-    st.header("문서관리")
+    ui.page_header("문서관리", "고객 운영")
     tab1, tab2 = st.tabs(["문서관리", "분류문서 보기"])
 
     # ===== 탭1: 신청건별 문서관리 =====

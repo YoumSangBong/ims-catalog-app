@@ -1,0 +1,18 @@
+# JoyDocs 화면 테마 (2026-11-15) — 허브 앱·고객 포털 공통.
+# 프로젝트 폴더에서 `streamlit run app.py` / `streamlit run branch_app.py`로 실행하면 자동 적용됩니다.
+[theme]
+base = "light"
+primaryColor = "#1F4E79"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F4F6F9"
+textColor = "#14233A"
+linkColor = "#1F4E79"
+borderColor = "#D5DAE3"
+showWidgetBorder = true
+baseRadius = "8px"
+font = "'Noto Sans KR':https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;600;700&display=swap, sans-serif"
+headingFont = "'Noto Sans KR':https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;600;700&display=swap, sans-serif"
+
+[theme.sidebar]
+backgroundColor = "#F7F9FC"
+secondaryBackgroundColor = "#EEF2F7"
